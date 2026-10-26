@@ -220,49 +220,57 @@ PyTorch → ONNX（固定 shape、constant folding）→ 量化（权重 INT4 bl
 
 关键推论：**600 MB 的模型只能放 HF。** GitHub Pages 的单文件 100 MB 是硬拒绝，push 直接失败，LFS 也绕不过去。所以“一个 GitHub Page 加一个 HF Space”这个切分是对的，而且不是可选的。
 
-### 布局
+### 布局（已落地）
 
 ```
-github.com/<you>/flip                    ← Pages 源，站点 < 100 MB
-├─ index.html
-├─ app.js  viewer/
-├─ scripts/                              ← 原来放在 paste.rs 里的东西搬进来
-│  ├─ k0_onnx_probe.py
-│  ├─ k1_quantize_bundle.py
-│  └─ k2_step_distill.py
-└─ docs/
+github.com/idefinity/research-webml-flip   ← 公开仓库，GPL-3.0
+├─ PLAN.md                                ← 这份文档
+├─ scripts/
+│  ├─ k0_onnx_probe.py                    ← 探针本体
+│  ├─ kaggle_kernel_body.py               ← kernel 正文：pip / clone / 权重 / 拉取
+│  └─ k1_quantize_bundle.py  k2_step_distill.py   ← 待写
+└─ site/                                  ← 待建，Pages 源
 
-huggingface.co/idefinity/flip-splat-int4  ← 权重，几百 MB 无所谓
-├─ encoder.onnx
-├─ vae_decoder.onnx
-├─ dit_2step_int4.onnx
-├─ gaussian_decoder.onnx
-├─ config.json  README.md  diagram.png
+huggingface.co/idefinity/flip-splat-int4   ← 权重，几百 MB 无所谓
+├─ encoder.onnx  vae_decoder.onnx  dit_2step_int4.onnx  gaussian_decoder.onnx
+└─ config.json  README.md  diagram.png
 ```
 
-仓库名沿用你 Ming 那套：`idefinity/<模型>-<档位>-<量化>`。
+仓库名沿用你 Ming 那套：`idefinity/<模型>-<档位>-<量化>`（模型仓库）。代码仓库用 `research-webml-flip`，和模型仓库分开：一个装代码，一个装权重。
+
+**GPL-3.0 这一条要先认下来。** 仓库建的时候带的就是 GPL-3，不是我们选的。它的含义很具体：站点上线时要把前端源码一并公开，别人可以拿去自己架一份。对一个发在煎蛋的玩具站来说这不是问题，但它是**不可逆**的——以后想闭源或者想换宽松许可都做不到，除非重写。TripoSplat 是 MIT，GPL-3 可以吸收它；反过来的方向不行。真在意的话，现在换 LICENSE 的成本是零，上线之后不是。
+
+### kernel 现在只是一个 SHA
+
+K0 之前，kernel 里塞着整份探测代码（两千行）。那和 paste.rs 是同一个毛病：kernel 顶着「v3」这个版本号，里面的代码却跟着每次粘贴漂移，旧版本号跑出来的东西再也说不清是哪份代码。
+
+现在是两级：kernel 正文只有十几行，写着一个 commit SHA，从仓库把 `kaggle_kernel_body.py` 拉下来执行；正文再去拉 `k0_onnx_probe.py`。改脚本 = 推一个 commit + 改 kernel 里那一行 SHA。
+
+一个实现细节值得留着：`raw.githubusercontent.com` 在某些网络下不通（这台机器就不通），`api.github.com/repos/<repo>/contents/<path>?ref=<sha>` 加 `Accept: application/vnd.github.raw` 返回**逐字节相同**的内容，而且换了个 host。所以两处都试，失败才算失败。
 
 ### Kaggle 侧：三个 notebook
 
-| Notebook | 机器 | 干什么 | 大概时长 |
+| Notebook | 机器 | 干什么 | 状态 |
 |---|---|---|---|
-| `flip-k0-onnx-probe` | T4 | 参数量 + 逐模块 ONNX 探测 | ✅ v3 已跑，3 分钟 GPU |
-| `flip-k0b-export-fix` | T4 | 修 DiT 适配层、fp16 导出、端到端数值对齐 | 1 h |
-| `flip-k2-step-distill` | T4 | flow matching 步数蒸馏，目标 2–4 步（**必做**） | 4–8 h |
-| `flip-k1-quantize-bundle` | CPU | INT4 + 打包 + onnxruntime 数值校验 + 传 HF | 1 h |
+| `flip-k0-onnx-probe` | T4 | 参数量 + 逐模块 ONNX 探测 + 数值校验 | v3 跑了参数量/延迟；v4 修 bug 后重跑 |
+| `flip-k2-step-distill` | T4 | flow matching 步数蒸馏，目标 2–4 步（**必做**） | 待写 |
+| `flip-k1-quantize-bundle` | CPU | INT4 + 打包 + onnxruntime 数值校验 + 传 HF | 待写 |
+
+原来的 `flip-k0b-export-fix` 取消了。两个导出 bug 都在脚本里，改脚本比开新 kernel 干净——这也是把代码搬进仓库之后第一个直接的好处。
 
 ### 相对你 Ming 那套要改三个地方
 
-**1. 脚本从 paste.rs 搬到 GitHub raw。**
-`ming_multistep.py`、`ming_export.py`、`ming_bundle.py` 现在都靠 `curl https://paste.rs/xxx` 取。paste.rs 是临时粘贴板，链接会过期，一旦过期那几个 notebook 就变成不可复现的了——版本号还在，但跑不起来。改成钉 commit：
+**1. 脚本从 paste.rs 搬到 GitHub raw。** ✅ 已改
 
-```python
-SHA = "<commit>"
-base = f"https://raw.githubusercontent.com/<you>/flip/{SHA}/scripts"
-subprocess.run(["curl","-fsSL",f"{base}/k1_quantize_bundle.py","-o","/kaggle/working/k1.py"], check=True)
+`ming_multistep.py`、`ming_export.py`、`ming_bundle.py` 现在都靠 `curl https://paste.rs/xxx` 取。paste.rs 是临时粘贴板，链接会过期，一旦过期那几个 notebook 就变成不可复现的了——版本号还在，但跑不起来。
+
+现在钉的是 commit：
+
+```
+https://raw.githubusercontent.com/idefinity/research-webml-flip/<sha>/scripts/k0_onnx_probe.py
 ```
 
-脚本改动有 diff、有回滚，notebook 本身可以很久不动。
+脚本改动有 diff、有回滚，kernel 本身可以很久不动。
 
 **2. token 用 Kaggle Secrets，不要 base64。**
 base64 只是换个编码，`aGZf` 开头加 `==` 结尾一眼就认得出来。private notebook 也不等于安全：协作者、fork、版本历史里都留着。
