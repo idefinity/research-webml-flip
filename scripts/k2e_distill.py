@@ -68,7 +68,16 @@ LR = float(os.environ.get("FLIP_LR", "5e-5"))
 ACCUM = int(os.environ.get("FLIP_ACCUM", "1"))
 SAVE_EVERY = int(os.environ.get("FLIP_SAVE_EVERY", "4"))
 DRY = os.environ.get("FLIP_DRY", "0") == "1"
-CKPT = os.environ.get("FLIP_CKPT", "1") == "1"
+# Weight on the camera channel's MSE. See the training loop: latent has 131072
+# elements and camera has 5, so unweighted the camera is invisible to the loss.
+W_CAM = float(os.environ.get("FLIP_W_CAM", "1"))
+# "sigma" (default) spaces the student's steps evenly in the schedule;
+# "index" spaces them evenly in teacher step count.
+GRID_MODE = os.environ.get("FLIP_GRID", "sigma").strip().lower()
+# Not CKPT - that name is already the weights directory above, and this flag
+# shadowed it, which is how a run died on 'bool' object has no attribute
+# 'rglob' after five minutes of tracing.
+GRAD_CKPT = os.environ.get("FLIP_CKPT", "1") == "1"
 
 # The factor that turns a difference of recorded t values into the dt the
 # sampler multiplies the velocity by. Measured before any pair is built unless
@@ -281,6 +290,37 @@ def trajectory(trace):
     return states, ts, as_map(trace["final"])
 
 
+def pick_grid(ts, n_int, s_steps):
+    """Which recorded states become the student's step boundaries.
+
+    Equal spacing in sigma, not in step index. The schedule is not linear in
+    the step index - the recorded t values are sigma*1000 for sigma =
+    3u/(1+2u), u uniform - so splitting 20 teacher steps four ways gives
+    dt = (0.1, 0.15, 0.25, 0.5): the last step covers half the distance on its
+    own. Euler truncation goes as dt^2, so the split that looks even actually
+    puts 0.25 of 0.345 of the total error into one step. Spacing in sigma
+    makes all four steps 0.25.
+
+    The indices are the nearest recorded state to each target sigma, forced
+    strictly increasing, and the last boundary is the endpoint itself.
+    """
+    if GRID_MODE == "index":
+        step = n_int // s_steps
+        if n_int % s_steps:
+            note(f"  {n_int} intervals over {s_steps} steps is not even")
+        return [min(i * step, n_int) for i in range(s_steps)] + [n_int]
+    start = ts[0]
+    idx, last = [], -1
+    for i in range(s_steps):
+        want = start - (start - 0.0) * i / s_steps
+        best = min(range(len(ts)), key=lambda j: abs(ts[j] - want))
+        if best <= last:
+            best = min(last + 1, len(ts) - 1)
+        idx.append(best)
+        last = best
+    return idx + [n_int]
+
+
 def build_pairs(traces):
     """One pair per student step boundary: (state_k, t_k, v*, dt, cond)."""
     pairs = []
@@ -307,11 +347,7 @@ def build_pairs(traces):
         if n_int < S_STEPS:
             note(f"  skip {tr['image']}: {n_int} intervals < {S_STEPS} steps")
             continue
-        step = n_int // S_STEPS
-        if n_int % S_STEPS:
-            note(f"  {tr['image']}: {n_int} intervals over {S_STEPS} steps "
-                 f"is not even - segments of {step} and one longer")
-        grid = [min(i * step, n_int) for i in range(S_STEPS)] + [n_int]
+        grid = pick_grid(ts, n_int, S_STEPS)
         for k in range(S_STEPS):
             i, j = grid[k], grid[k + 1]
             x0, x1 = all_states[i], all_states[j]
@@ -399,6 +435,51 @@ def to_dev(m):
     weights are fp32, and outside autocast an fp16 input against fp32 weights
     fails on the elementwise ops."""
     return {k: v.to(DEV).float() for k, v in m.items()}
+
+
+def evaluate(student, traces, grid_json, tag):
+    """Four student steps against the teacher's twenty, from the same start.
+
+    Run once before training too. That first number is not a formality: it is
+    how far plain Euler on the frozen grid lands from the teacher's endpoint
+    with the teacher's own weights, i.e. the integration error the student has
+    to absorb. Everything the training achieves is measured against it.
+    """
+    note("=" * 72)
+    note(f"eval [{tag}]: student {len(grid_json['t'])} steps vs teacher, "
+         f"same start state")
+    rows = []
+    for tr in traces[:4]:
+        states, ts, final = trajectory(tr)
+        if len(states) < 2:
+            continue
+        cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
+                for k, v in split_call(tr["calls"][0])[2].items()}
+        x0 = states[0]
+        try:
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16,
+                                                 enabled=(DEV.type == "cuda")):
+                xs = integrate(student, x0, grid_json["t"], grid_json["dt"], cond)
+            out = {}
+            for ch in ("latent", "camera"):
+                if ch not in xs or ch not in final:
+                    continue
+                a = xs[ch].float().flatten()
+                b = final[ch].to(DEV).float().flatten()
+                out[ch] = {
+                    "cos": round(torch.nn.functional.cosine_similarity(
+                        a, b, dim=0).item(), 4),
+                    "rel_l2": round(((a - b).norm() / b.norm()).item(), 4),
+                }
+            note(f"  {tr['image']}  " + "  ".join(
+                f"{ch} cos {m['cos']:.4f} rel-l2 {m['rel_l2']:.3f}"
+                for ch, m in out.items()))
+            rows.append({"image": tr["image"], "tag": tag, "channels": out})
+        except Exception:  # noqa: BLE001
+            note(f"  {tr['image']} eval failed")
+            note(traceback.format_exc()[-800:])
+    R["eval"].extend(rows)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +594,9 @@ def main():
     student.train()
     n_par = sum(p.numel() for p in student.parameters())
     note(f"student params {n_par / 1e6:.1f} M  fp32 Adam state ~{n_par * 12 / 1e9:.1f} GB")
-    if CKPT:
+    with torch.no_grad():
+        evaluate(student, traces, grid_json, "before")
+    if GRAD_CKPT:
         # The smoke run skipped every single sample on OOM: inference fits
         # easily because nothing is retained, but a backward through 24 layers
         # over 8192 latent tokens plus 4101 conditioning tokens does not.
@@ -545,7 +628,7 @@ def main():
     t0 = time.time()
     for epoch in range(EPOCHS):
         order = torch.randperm(len(pairs)).tolist()
-        run_loss, run_n, skipped = 0.0, 0, 0
+        run_loss, run_n, skipped, run_terms = 0.0, 0, 0, {}
         opt.zero_grad(set_to_none=True)
         for bi, idx in enumerate(order):
             p = pairs[idx]
@@ -557,8 +640,14 @@ def main():
                 with torch.autocast("cuda", dtype=torch.float16,
                                     enabled=(DEV.type == "cuda")):
                     v = forward_velocity(student, state, p["t"], cond)
-                    loss = sum(torch.nn.functional.mse_loss(
-                        v[k].float(), tgt[k]) for k in tgt if k in v) / ACCUM
+                    terms = {k: torch.nn.functional.mse_loss(v[k].float(), tgt[k])
+                             for k in tgt if k in v}
+                    # Latent is 8192x16 and camera is 1x5. Summing the two MSEs
+                    # unweighted gives camera a 4e-5 share of the gradient and
+                    # it never gets learned, even though it drifts by more than
+                    # its own norm over the trajectory.
+                    loss = (sum(terms[k] * (W_CAM if k == "camera" else 1.0)
+                                for k in terms) / ACCUM)
                 scaler.scale(loss).backward()
             except torch.cuda.OutOfMemoryError as exc:
                 # A three-hour run should not end because one sample was the
@@ -577,44 +666,27 @@ def main():
                 continue
             run_loss += loss.item() * ACCUM
             run_n += 1
+            for k, val in terms.items():
+                run_terms[k] = run_terms.get(k, 0.0) + float(val)
             if (bi + 1) % ACCUM == 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
-        note(f"epoch {epoch:3d}  loss {run_loss / max(run_n, 1):.6f}  "
+        per = "  ".join(f"{k} {v / max(run_n, 1):.5f}" for k, v in sorted(run_terms.items()))
+        note(f"epoch {epoch:3d}  loss {run_loss / max(run_n, 1):.6f}  {per}  "
              f"skipped {skipped}  {(time.time() - t0) / 60:.1f} min")
         R["training"].append({"epoch": epoch, "loss": run_loss / max(run_n, 1),
-                              "skipped": skipped})
+                              "skipped": skipped,
+                              "terms": {k: v / max(run_n, 1)
+                                        for k, v in run_terms.items()}})
         save()
         if SAVE_EVERY and (epoch + 1) % SAVE_EVERY == 0:
             dump(f"student_e{epoch + 1:03d}.pt")
 
     student.eval()
-    note("=" * 72)
-    note("eval: student 4 steps vs teacher 20 steps, same start state")
-    for tr in traces[:4]:
-        states, ts, final = trajectory(tr)
-        if len(states) < 2:
-            continue
-        cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
-                for k, v in split_call(tr["calls"][0])[2].items()}
-        x0 = states[0]
-        try:
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16,
-                                                 enabled=(DEV.type == "cuda")):
-                xs = integrate(student, x0, grid_json["t"], grid_json["dt"], cond)
-            a = xs["latent"].float().flatten()
-            b = final["latent"].to(DEV).float().flatten()
-            cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
-            rel = ((a - b).norm() / b.norm()).item()
-            note(f"  {tr['image']}  cos {cos:.4f}  rel-l2 {rel:.3f}")
-            R["eval"].append({"image": tr["image"], "cos": round(cos, 4),
-                              "rel_l2": round(rel, 4)})
-        except Exception:  # noqa: BLE001
-            note(f"  {tr['image']} eval failed")
-            note(traceback.format_exc()[-800:])
+    evaluate(student, traces, grid_json, "final")
 
     torch.save({"model": student.state_dict(), "grid": grid_json,
                 "s_steps": S_STEPS}, OUT / "student.pt")
