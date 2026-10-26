@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>webgpu gemm bench v2</title></head>
+<body style="font:13px ui-monospace,monospace">
+<pre id="out">running</pre>
+<script type="module">
+// 64x64 block tile, 16x16 threads, 4x4 register blocking per thread.
+// v1 (1 output per thread) measured shared-memory bandwidth, not FLOPS; it said
+// 550 GFLOPS f32, which is far below the M5's arithmetic peak. This one is
+// close enough to a real SGEMM to be worth comparing against ORT's 2.0 TFLOPS.
+
+const N = 2048;
+const PAD = 0;          // no padding: 16 divides 64 cleanly here
+const WARMUP = 2;
+const PASSES = 7;
+
+function src(dtype) {
+  const isF16 = dtype === "f16";
+  const T = isF16 ? "f16" : "f32";
+  return `
+${isF16 ? "enable f16;" : ""}
+struct Meta { n: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<uniform> cfg: Meta;
+@group(0) @binding(1) var<storage, read> A: array<${T}>;
+@group(0) @binding(2) var<storage, read> B: array<${T}>;
+@group(0) @binding(3) var<storage, read_write> C: array<${T}>;
+
+var<workgroup> As: array<array<${T}, 16>, 64>;
+var<workgroup> Bs: array<array<${T}, 64>, 16>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let n = cfg.n;
+  let tx = lid.x;
+  let ty = lid.y;
+  let row0 = wid.y * 64u;
+  let col0 = wid.x * 64u;
+
+  var acc: array<array<${T}, 4>, 4>;
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = ${T}(0.0); }
+  }
+
+  var k0: u32 = 0u;
+  loop {
+    if (k0 >= n) { break; }
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      As[ty + i * 16u][tx] = A[(row0 + ty + i * 16u) * n + k0 + tx];
+      Bs[tx][ty + i * 16u] = B[(k0 + tx) * n + col0 + ty + i * 16u];
+    }
+    workgroupBarrier();
+
+    for (var k = 0u; k < 16u; k = k + 1u) {
+      var a: array<${T}, 4>;
+      var b: array<${T}, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { a[i] = As[ty * 4u + i][k]; }
+      for (var j = 0u; j < 4u; j = j + 1u) { b[j] = Bs[k][tx * 4u + j]; }
+      for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+          acc[i][j] = acc[i][j] + a[i] * b[j];
+        }
+      }
+    }
+    workgroupBarrier();
+    k0 = k0 + 16u;
+  }
+
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    for (var j = 0u; j < 4u; j = j + 1u) {
+      C[(row0 + ty * 4u + i) * n + col0 + tx * 4u + j] = acc[i][j];
+    }
+  }
+}
+`;
+}
+
+async function run(device, dtype) {
+  const isF16 = dtype === "f16";
+  const bpe = isF16 ? 2 : 4;
+  const nbytes = N * N * bpe;
+
+  const mk = (fill) => {
+    const b = device.createBuffer({ size: nbytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(b, 0, isF16
+      ? new Uint16Array(N * N).fill(fill ? 0x3c00 : 0)
+      : new Float32Array(N * N).fill(fill));
+    return b;
+  };
+  const A = mk(1), B = mk(1), C = mk(0);
+  const cfg = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(cfg, 0, new Uint32Array([N, 0, 0, 0]));
+
+  const module = device.createShaderModule({ code: src(dtype) });
+  const info = await module.getCompilationInfo();
+  const errs = info.messages.filter(m => m.type === "error");
+  if (errs.length) throw new Error(dtype + ": " + errs.map(e => e.message).join("; "));
+
+  const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: cfg } },
+      { binding: 1, resource: { buffer: A } },
+      { binding: 2, resource: { buffer: B } },
+      { binding: 3, resource: { buffer: C } },
+    ],
+  });
+
+  const groups = Math.ceil(N / 64);
+  const once = async () => {
+    const enc = device.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(pipeline);
+    p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(groups, groups, 1);
+    p.end();
+    device.queue.submit([enc.finish()]);
+    const t0 = performance.now();
+    await device.queue.onSubmittedWorkDone();
+    return performance.now() - t0;
+  };
+
+  for (let i = 0; i < WARMUP; i++) await once();
+  const times = [];
+  for (let i = 0; i < PASSES; i++) times.push(await once());
+  times.sort((a, b) => a - b);
+  const median = times[Math.floor(times.length / 2)];
+  const flops = 2 * N * N * N;
+  const gflops = flops / (median / 1000) / 1e9;
+  [A, B, C, cfg].forEach(b => b.destroy());
+  return { dtype, median_ms: +median.toFixed(2), gflops: +gflops.toFixed(1),
+           min_ms: +times[0].toFixed(2) };
+}
+
+(async () => {
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (s) => { lines.push(s); out.textContent = lines.join("\n"); };
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) throw new Error("no adapter");
+    const feats = [...adapter.features];
+    const device = await adapter.requestDevice({
+      requiredFeatures: feats.includes("shader-f16") ? ["shader-f16"] : [],
+    });
+    log("vendor=" + adapter.info.vendor + " arch=" + adapter.info.architecture +
+        " shader-f16=" + feats.includes("shader-f16"));
+    log("N=" + N + "  64x64 tile, 4x4 per thread  (" + (2 * N ** 3 / 1e9).toFixed(2) + " GFLOP/pass)");
+    const r32 = await run(device, "f32");
+    log(`f32  ${r32.median_ms} ms  ${r32.gflops} GFLOPS  (best ${r32.min_ms} ms)`);
+    if (feats.includes("shader-f16")) {
+      const r16 = await run(device, "f16");
+      log(`f16  ${r16.median_ms} ms  ${r16.gflops} GFLOPS  (best ${r16.min_ms} ms)   -> ${(r16.gflops / r32.gflops).toFixed(2)}x`);
+    }
+  } catch (e) {
+    log("FAIL " + e.message);
+  }
+  document.title = "READY";
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>webgpu int4 gemm bench</title></head>
+<body style="font:13px ui-monospace,monospace">
+<pre id="out">running</pre>
+<script type="module">
+// Same 64x64 / 4x4 blocked kernel as v2, but the weights arrive as packed int4
+// (8 nibbles per u32, per-column scale) and are dequantised on the way into
+// shared memory. That is how MatMulNBits actually spends its time, so the
+// comparison against v2's f16 GEMM is the honest version of "does INT4 buy 2x".
+
+const N = 2048;
+const WARMUP = 2;
+const PASSES = 7;
+
+const CODE = `
+enable f16;
+struct Meta { n: u32, pad0: u32, pad1: u32, pad2: u32 };
+@group(0) @binding(0) var<uniform> cfg: Meta;
+@group(0) @binding(1) var<storage, read> A: array<f16>;
+@group(0) @binding(2) var<storage, read> Bp: array<u32>;
+@group(0) @binding(3) var<storage, read> S: array<f32>;
+@group(0) @binding(4) var<storage, read_write> C: array<f16>;
+
+var<workgroup> As: array<array<f16, 16>, 64>;
+var<workgroup> Bs: array<array<f16, 64>, 16>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let n = cfg.n;
+  let tx = lid.x;
+  let ty = lid.y;
+  let row0 = wid.y * 64u;
+  let col0 = wid.x * 64u;
+
+  var acc: array<array<f16, 4>, 4>;
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    for (var j = 0u; j < 4u; j = j + 1u) { acc[i][j] = f16(0.0); }
+  }
+
+  var k0: u32 = 0u;
+  loop {
+    if (k0 >= n) { break; }
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      As[ty + i * 16u][tx] = A[(row0 + ty + i * 16u) * n + k0 + tx];
+      let c: u32 = col0 + ty + i * 16u;
+      let w: u32 = Bp[(((k0 + tx) * n + c) >> 3u)];
+      let q: u32 = (w >> ((c & 7u) * 4u)) & 15u;
+      Bs[tx][ty + i * 16u] = f16(f32(q) - 8.0) * f16(S[c]);
+    }
+    workgroupBarrier();
+
+    for (var k = 0u; k < 16u; k = k + 1u) {
+      var a: array<f16, 4>;
+      var b: array<f16, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { a[i] = As[ty * 4u + i][k]; }
+      for (var j = 0u; j < 4u; j = j + 1u) { b[j] = Bs[k][tx * 4u + j]; }
+      for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+          acc[i][j] = acc[i][j] + a[i] * b[j];
+        }
+      }
+    }
+    workgroupBarrier();
+    k0 = k0 + 16u;
+  }
+
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    for (var j = 0u; j < 4u; j = j + 1u) {
+      C[(row0 + ty * 4u + i) * n + col0 + tx * 4u + j] = acc[i][j];
+    }
+  }
+}
+`;
+
+(async () => {
+  const out = document.getElementById("out");
+  const lines = [];
+  const log = (s) => { lines.push(s); out.textContent = lines.join("\n"); };
+  try {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const feats = [...adapter.features];
+    const device = await adapter.requestDevice({ requiredFeatures: ["shader-f16"] });
+
+    const aBytes = N * N * 2;
+    const bBytes = (N * N / 8) * 4;
+    const A = device.createBuffer({ size: aBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(A, 0, new Uint16Array(N * N).fill(0x3c00));
+    const Bp = device.createBuffer({ size: bBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    // nibble value 8 -> (q - 8) = 0, so the product is zero but the ALU work is real
+    device.queue.writeBuffer(Bp, 0, new Uint32Array(N * N / 8).fill(0x88888888));
+    const S = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(S, 0, new Float32Array(N).fill(1));
+    const C = device.createBuffer({ size: aBytes, usage: GPUBufferUsage.STORAGE });
+    const cfg = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(cfg, 0, new Uint32Array([N, 0, 0, 0]));
+
+    const module = device.createShaderModule({ code: CODE });
+    const info = await module.getCompilationInfo();
+    const errs = info.messages.filter(m => m.type === "error");
+    if (errs.length) throw new Error(errs.map(e => e.message).join("; "));
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const bg = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: cfg } },
+        { binding: 1, resource: { buffer: A } },
+        { binding: 2, resource: { buffer: Bp } },
+        { binding: 3, resource: { buffer: S } },
+        { binding: 4, resource: { buffer: C } },
+      ],
+    });
+
+    const groups = Math.ceil(N / 64);
+    const once = async () => {
+      const enc = device.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(pipeline);
+      p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(groups, groups, 1);
+      p.end();
+      device.queue.submit([enc.finish()]);
+      const t0 = performance.now();
+      await device.queue.onSubmittedWorkDone();
+      return performance.now() - t0;
+    };
+    for (let i = 0; i < WARMUP; i++) await once();
+    const times = [];
+    for (let i = 0; i < PASSES; i++) times.push(await once());
+    times.sort((a, b) => a - b);
+    const median = times[Math.floor(times.length / 2)];
+    const gf = 2 * N * N * N / (median / 1000) / 1e9;
+    log("int4 weights + f16 activations, 64x64 tile / 4x4 per thread");
+    log(`w bytes ${(bBytes / 1e6).toFixed(1)} MB vs f16 ${(aBytes / 1e6).toFixed(1)} MB`);
+    log(`int4 ${median.toFixed(2)} ms  ${gf.toFixed(1)} GFLOPS  (best ${times[0].toFixed(2)} ms)`);
+  } catch (e) {
+    log("FAIL " + e.message);
+  }
+  document.title = "READY";
+})();
+</script>
+</body>
+</html>
