@@ -9,7 +9,7 @@
 // 550 GFLOPS f32, which is far below the M5's arithmetic peak. This one is
 // close enough to a real SGEMM to be worth comparing against ORT's 2.0 TFLOPS.
 
-const N = 2048;
+const N = parseInt(new URLSearchParams(location.search).get("n") || "2048", 10);
 const PAD = 0;          // no padding: 16 divides 64 cleanly here
 const WARMUP = 2;
 const PASSES = 7;

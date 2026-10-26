@@ -171,6 +171,12 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/input/"):
             return self._file(self.ply_dir / name, "image/*")
 
+        if route.startswith("/bench/"):
+            # whitelist by basename so /bench/../../etc can't escape
+            if name.endswith(".html") and Path(name).name == name and (HERE / name).is_file():
+                return self._file(HERE / name, "text/html; charset=utf-8")
+            return self._send(b"no such bench", "text/plain", 404)
+
         if route.startswith("/vendor/"):
             if name not in {"three.module.js", "three.core.js", "spark.module.js"}:
                 return self._send(b"not vendored", "text/plain", 404)
