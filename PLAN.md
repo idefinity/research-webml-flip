@@ -84,7 +84,7 @@ LGM 的单图 → 65,536 高斯在 **`SpawnDev.ILGPU.ML` 自己的 demo 里**（
 
 ## K0 实测（已完成，T4 / torch 2.11）
 
-Kaggle：`kkonda/flip-k0-onnx-probe` v3。TripoSplat @ `d8db9e0`，权重 `VAST-AI/TripoSplat`，磁盘 4.2 GB。
+Kaggle：`kkonda/flip-k0-onnx-probe`，v3 与 v4 两轮。TripoSplat @ `d8db9e0`，权重 `VAST-AI/TripoSplat`，磁盘 4.2 GB。v4 起 kernel 里只有一行 SHA，代码从 `scripts/` 取。
 
 ### 参数量
 
@@ -102,14 +102,14 @@ Kaggle：`kkonda/flip-k0-onnx-probe` v3。TripoSplat @ `d8db9e0`，权重 `VAST-
 
 ### 延迟（T4，20 步，65K 高斯）
 
-| 阶段 | 耗时 |
-|---|---|
-| 预处理（BiRefNet） | 1.94 s |
-| 编码（DINOv3 + VAE） | 7.22 s |
-| 采样 20 步 | **80.3 s** |
-| 解码 65K 高斯 | 0.62 s |
+| 阶段 | v3 | v4 |
+|---|---|---|
+| 预处理（BiRefNet） | 1.94 s | 3.65 s |
+| 编码（DINOv3 + VAE） | 7.22 s | 6.92 s |
+| 采样 20 步 | 80.3 s | **75.2 s** |
+| 解码 65K 高斯 | 0.62 s | 0.64 s |
 
-采样一步 4.0 秒。DiT 单步 **23.8 TFLOP**（FLOP 计数器实测，不是估的），20 步 475 TFLOP。反推 T4 的有效吞吐只有约 5.9 TFLOPS。
+采样一步 3.76 秒。DiT 单步 **23.8 TFLOP**（FLOP 计数器实测，不是估的），20 步 475 TFLOP。反推 T4 的有效吞吐 6.3 TFLOPS。两轮差的那 5 秒是热机噪声，不必在意。
 
 ### 三个结论
 
@@ -122,9 +122,53 @@ DiT 和两个解码器都用 `torch.polar` / `view_as_complex` 做 3D RoPE，我
 **3. 20 步在浏览器里不可能。**
 475 TFLOP。就算浏览器 GPU 跑到 40 TFLOPS（已经很乐观），也是 12 秒，还没算编码和下载。**步数蒸馏从“看情况”变成“必须做”**，而且目标不是 8 步，是 2–4 步。
 
-### 还没验的
+### 数值校验（v4 新增，这条比“能导出”重要）
 
-Flow DiT 的导出卡在适配层，不是模型本身：`torch.fx` 报 `Proxy object cannot be iterated`，来自 dict 输入的 pytree 处理。同一轮里 dinov3 / VAE 的失败是我的 bug——pipeline 把它们加载成 bf16，我喂了 fp16，属于 dtype 不匹配，不是算子问题。下一轮 K0b 修掉这两处。
+导出成功只是第一关，图里算的东西对不对是另一关。v4 用 onnxruntime 跑导出的图，和 eager 逐元素比：
+
+| 模块 | cosine | mean_abs | 判定 |
+|---|---|---|---|
+| gs_decoder | 1.000093 | 0.0048 | 对得上，fp16 噪声 |
+| octree_level | 0.999996 | 0.0097 | 对得上 |
+
+`max_abs` 会冒出 0.87 这种数，`max_rel` 会冒出 1116 这种数——都是 fp16 在接近零的分量上放大出来的。看 cosine 和 mean_abs 才有意义。
+
+### bf16 是条死路（v4 实测）
+
+dinov3 和 vae_encoder 现在能导出了（dtype 从模块自己身上读，不再硬编码 fp16），但 onnxruntime 拒绝加载：
+
+```
+Type 'tensor(bfloat16)' of input parameter ... is an invalid model
+```
+
+两个后果，指向同一个决定：
+
+- **ONNX 没有 ORT 肯加载的 bf16 张量类型。**
+- **WebGPU 也没有 bf16 的存储格式**，JS 侧连一个能装它的 typed array 都没有。
+
+所以编码器在导出前必须 cast 成 fp16。这不是优化，是前提。K0b 在量 cast 之后掉多少精度。
+
+### flow_dit 那次“失败”是探针骗了自己
+
+v3 里 `flow_dit` 报 `Proxy object cannot be iterated`，我把账记在模型的 dict 输入上。这个归因错了，证据是：同一个模块在 `sample_latent` 里被 eager 跑了 20 次，全程正常。
+
+真实机制：探针先对适配层调 `torch.fx.symbolic_trace`，它抛异常，然后**同一个模块接着做 eager 调用，报的是一模一样的 Proxy 错误**。失败的 trace 把模块留在了不可用的状态，探针污染了自己的对照组。
+
+教训写进脚本了：**eager 基准必须在任何 trace 之前取**，DiT 不走 symbolic_trace。
+
+### ONNX 总量（fp16，未量化）
+
+| 模块 | 文件 |
+|---|---|
+| dinov3 | 1682 MB |
+| gs_decoder | 476 MB |
+| octree_level | 102 MB |
+| vae_encoder | 69 MB |
+| **小计（不含 DiT）** | **2328 MB** |
+
+加上 DiT 的 741 MB 就是约 3.07 GB fp16。INT4 是 904 MB——中间差着一个 4-bit 量化、一个 2–4 步蒸馏、和一整套分片下载设计。
+
+一个容易踩的坑：dynamo 路径导出的 `.onnx` 只有 0.3 MB，权重在旁边的 `.onnx.data` 里。按 `.onnx` 文件大小判断模型体积会被骗到脚底下。
 
 ---
 
@@ -132,21 +176,23 @@ Flow DiT 的导出卡在适配层，不是模型本身：`torch.fx` 报 `Proxy o
 
 ### 1.1 转换链
 
-PyTorch → ONNX（固定 shape、constant folding）→ 量化（权重 INT4 block 128 对称，激活 FP16）。
+PyTorch → **先统一 cast 到 fp16** → ONNX（固定 shape、constant folding）→ 量化（权重 INT4 block 128 对称，激活 FP16）。
 
-两个具体的坑：
+cast 这一步是 K0 逼出来的，不是可选项：dinov3 和 flux2 VAE 是以 bf16 加载的，而 bf16 既没有 ORT 肯加载的 ONNX 张量类型，也没有 WebGPU 的存储格式。留着 bf16 导出，图能生成，加载即失败。
+
+三个具体的坑：
 
 - **ORT Web 的 WebGPU MatMulNBits 只认 uint8 zero point。** 用 float / HQQ zero point 量出来的模型不会报错，会静默掉回 CPU，慢 10–40 倍。导出后必须逐节点确认每个 MatMulNBits 落在哪个 EP 上。
 - opset 17 和 21 会混用（NanoDiffuser 就在 U-Net 的 FP16 反量化上切到 21），需要分段导出。
+- dynamo 导出器把权重写进 `.onnx.data`，`.onnx` 本身可能只有几百 KB。核体积要两个加起来。
 
 ### 1.2 八叉树采样器
 
-两条路，按时间选：
+**不需要改写。** K0 逐层导出成功，`sample()` 里只有一处真 host sync（`mask.sum(dim=1).max().item()`）。
 
-- **WGSL 重写**：保真度高，工作量集中在 compute shader 和内存布局
-- **退化成固定分辨率网格解码**：把动态八叉树换成固定 128³ 或 256³ 的稠密解码，牺牲细节换可行性
+浏览器侧要做的是：把 8 层循环、以及那个 `item()` 带来的同步，放在 JS / WGSL 里，每层调用导出的定形 transformer。模型部分已经现成。
 
-先用退化方案把整条链跑通，再决定要不要回头做真八叉树。
+原计划里的「退化成固定 128³ 网格」删掉了——它解决的是一个不存在的问题，而且代价被高估过。
 
 ### 1.3 预算（按 K0 实测量级重写）
 

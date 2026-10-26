@@ -176,10 +176,12 @@ def probe_dit(flow):
         return
 
     # 1b. torch.export capture - the honest question: can this graph be captured
+    # NB: `import torch.export` inside a function binds `torch` as a *local*
+    # name and shadows the module-level import; import the symbol instead.
     try:
-        import torch.export  # noqa: F401,PLC0415
+        from torch.export import export as torch_export  # noqa: PLC0415
         t0 = time.time()
-        ep = torch.export.export(fa, tuple(args))
+        ep = torch_export(fa, tuple(args))
         secs = time.time() - t0
         nodes = len(list(ep.graph.nodes))
         R["dit"]["export_capture_ok"] = True
