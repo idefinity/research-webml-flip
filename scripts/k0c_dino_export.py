@@ -161,7 +161,7 @@ def export_and_check(name, mod, args, ref, allow_cpu=False,
             rc["accuracy"] = compare(f"{name}/{tag}", o0, ref)
             # a graph that ignores its input would return the same thing twice
             alt = {k: (v * 0 + 1 if v.dtype.kind == "f" else v) for k, v in feeds.items()}
-            out2 = sess.run(None, feeds=alt)
+            out2 = sess.run(None, alt)
             rc["changes_with_input"] = bool(
                 abs(float(torch.from_numpy(out2[0]).float().mean())
                     - float(o0.float().mean())) > 1e-4)
