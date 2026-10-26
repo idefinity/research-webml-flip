@@ -327,9 +327,14 @@ def unwrap(rec):
         for v in list(c["args"]) + list(c["kwargs"].values()):
             if torch.is_tensor(v) and v.numel() == 1:
                 flat.append(float(v.flatten()[0]))
+        # Cond features, and only those. The state dict shares the model's
+        # output keys, so "disjoint from out" is how to tell the two apart
+        # without hardcoding anyone's field names. Counting every dict here
+        # gave 40 distinct "branches" for 40 calls and told me nothing.
+        out_keys = set(c["out"]) if isinstance(c["out"], dict) else set()
         feats = []
         for v in list(c["args"]) + list(c["kwargs"].values()):
-            if isinstance(v, dict):
+            if isinstance(v, dict) and out_keys and not (set(v) & out_keys):
                 for k, t in v.items():
                     if torch.is_tensor(t):
                         feats.append(f"{k}:{_hash(t)}")
@@ -349,13 +354,36 @@ def unwrap(rec):
 # the work
 # ---------------------------------------------------------------------------
 
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+
 def pick_images():
+    """Repo examples first, then FLIP_IMAGE_DIR if it points somewhere.
+
+    The upstream repo ships four example inputs and no more, which is not
+    enough to distill on - four objects means four distinct conditioning
+    features, and the student can latch onto those instead of learning the
+    straightening. Anything attached as a Kaggle dataset lands under
+    /kaggle/input and can be pointed at here.
+    """
+    cands = []
     ex = REPO / "static" / "example_inputs"
-    cands = sorted(p for p in ex.glob("*")
-                   if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
+    if ex.is_dir():
+        cands += [p for p in sorted(ex.glob("*")) if p.suffix.lower() in IMG_EXT]
     if not cands:
-        cands = [p for p in sorted((REPO / "static").rglob("*"))
-                 if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
+        cands += [p for p in sorted((REPO / "static").rglob("*"))
+                  if p.suffix.lower() in IMG_EXT]
+
+    extra = os.environ.get("FLIP_IMAGE_DIR", "").strip()
+    if extra:
+        root = Path(extra)
+        found = []
+        if root.is_dir():
+            found = sorted(p for p in root.rglob("*") if p.suffix.lower() in IMG_EXT)
+        elif root.is_file():
+            found = [root]
+        note(f"FLIP_IMAGE_DIR {extra}: {len(found)} images")
+        cands += found
     return cands[:N_IMG]
 
 

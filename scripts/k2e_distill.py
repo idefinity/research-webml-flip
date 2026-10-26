@@ -28,7 +28,11 @@ endpoint. Three consequences, all good:
     constants must be used by the browser sampler; they are written to
     grid.json for exactly that reason.
 
-Writes k2e/student.pt, grid.json, eval.json, and eval PLYs.
+The state is a dict: latent is [1, 8192, 16] and camera is [1, 1, 5], and the
+sampler integrates both. Both are advanced here, because freezing the camera
+would feed the student a state at steps 2..4 that the teacher never visited.
+
+Writes k2e/student.pt, grid.json, and report.json.
 
 Env:
   FLIP_TRACE_DIR  where k2d wrote its traces (default /kaggle/working/k2d)
@@ -41,7 +45,6 @@ Env:
 
 import copy
 import json
-import math
 import os
 import sys
 import time
@@ -63,10 +66,8 @@ EPOCHS = int(os.environ.get("FLIP_EPOCHS", "40"))
 LR = float(os.environ.get("FLIP_LR", "5e-5"))
 ACCUM = int(os.environ.get("FLIP_ACCUM", "4"))
 DRY = os.environ.get("FLIP_DRY", "0") == "1"
-N_GAUSS = 65536
-SEED = 7
 
-R = {"notes": [], "pairs": [], "training": [], "eval": []}
+R = {"notes": [], "training": [], "eval": []}
 
 
 def note(msg):
@@ -76,8 +77,7 @@ def note(msg):
 
 
 def save(name="report.json"):
-    (OUT / name).write_text(json.dumps(
-        {k: v for k, v in R.items() if k != "pairs"}, indent=2, default=str))
+    (OUT / name).write_text(json.dumps(R, indent=2, default=str))
 
 
 # ---------------------------------------------------------------------------
@@ -109,37 +109,42 @@ def load_trace(path):
     return p
 
 
-def state_latent(state):
+def as_map(state):
+    """States come as {'latent', 'camera'} or, hypothetically, a bare tensor."""
     if torch.is_tensor(state):
-        return state
-    if isinstance(state, dict):
-        for k in ("latent", "x", "sample"):
-            if k in state:
-                return state[k]
-        raise KeyError(f"no latent in state dict: {list(state)}")
-    raise TypeError(type(state).__name__)
+        return {"latent": state}
+    return {k: v for k, v in state.items() if torch.is_tensor(v)}
+
+
+def state_latent(state):
+    m = as_map(state)
+    for k in ("latent", "x", "sample"):
+        if k in m:
+            return m[k]
+    raise KeyError(f"no latent in state: {list(m)}")
 
 
 def split_call(call):
     """Recover (state, t, cond) from whatever the sampler actually passed.
 
-    The trace stores the raw args, so this has to tolerate positional and
-    keyword calls. k2d printed the shapes on its first run precisely so this
-    function could be written against the real thing.
+    The trace stores raw args, so this has to tolerate positional and keyword
+    calls. k2d printed the real signature on its first run - args were
+    ({latent, camera}, t, {feature1, feature2}) - precisely so this could be
+    written against fact instead of guesswork.
     """
     args, kwargs = call["args"], call["kwargs"]
     state = t = cond = None
-    positional = [a for a in args if not isinstance(a, (int, float))]
-    for a in positional:
-        if isinstance(a, dict) and any(k in a for k in ("latent", "x", "sample")):
+    for a in args:
+        if isinstance(a, dict) and set(a) & {"latent", "x", "sample"}:
             state = a
         elif torch.is_tensor(a) and a.numel() == 1:
             t = a
         elif isinstance(a, dict):
             cond = a
-        elif torch.is_tensor(a) and a.dim() >= 1 and a.numel() > 1:
-            # a bare latent tensor, no camera
+        elif torch.is_tensor(a) and a.numel() > 1 and state is None:
             state = {"latent": a}
+        elif isinstance(a, (int, float)) and t is None:
+            t = torch.tensor(float(a))
     for k, v in kwargs.items():
         lk = k.lower()
         if "state" in lk or lk in ("x", "inputs"):
@@ -148,9 +153,6 @@ def split_call(call):
             t = v
         elif "cond" in lk or lk == "c":
             cond = v
-    for a in args:
-        if isinstance(a, (int, float)) and t is None:
-            t = torch.tensor(float(a))
     if state is None or t is None:
         raise RuntimeError(f"cannot split call: args={[type(a).__name__ for a in args]} "
                            f"kwargs={list(kwargs)}")
@@ -167,22 +169,19 @@ def trajectory(trace):
     states, ts, seen_last = [], [], None
     for call in trace["calls"]:
         state, t, _ = split_call(call)
-        x = state_latent(state)
+        m = as_map(state)
         key = (float(torch.as_tensor(t).flatten()[0].float()),
-               round(float(x.float().sum()), 4))
+               round(sum(float(v.float().sum()) for v in m.values()), 3))
         if key == seen_last:
             continue
         seen_last = key
-        states.append(x)
+        states.append(m)
         ts.append(float(torch.as_tensor(t).flatten()[0].float()))
-    final = trace["final"]
-    if isinstance(final, dict):
-        final = state_latent(final)
-    return states, ts, final
+    return states, ts, as_map(trace["final"])
 
 
 def build_pairs(traces):
-    """One pair per student step boundary: (x_k, t_k, v*, dt, cond) per image."""
+    """One pair per student step boundary: (state_k, t_k, v*, dt, cond)."""
     pairs = []
     grid = None
     for tr in traces:
@@ -192,10 +191,10 @@ def build_pairs(traces):
             continue
         cond = split_call(tr["calls"][0])[2]
         n = len(states)
-        # dt between consecutive recorded states. The sampler makes one update
-        # per call, so there are n intervals for n recorded states - the last
-        # one lands on `final` and has no recorded t of its own. Reuse the
-        # previous interval for it rather than inventing a terminal t.
+        # dt between consecutive recorded states. One update per call, so there
+        # are n intervals for n recorded states - the last one lands on `final`
+        # and has no recorded t of its own. Reuse the previous interval for it
+        # rather than inventing a terminal t.
         dts = [ts[i + 1] - ts[i] for i in range(n - 1)]
         if dts:
             dts.append(dts[-1])
@@ -211,10 +210,11 @@ def build_pairs(traces):
         grid = [min(i * step, n_int) for i in range(S_STEPS)] + [n_int]
         for k in range(S_STEPS):
             i, j = grid[k], grid[k + 1]
-            x0 = all_states[i]
-            x1 = all_states[j]
+            x0, x1 = all_states[i], all_states[j]
             span = sum(dts[i:j])
-            move = (x1.float() - x0.float()).norm().item()
+            keys = [k2 for k2 in x0 if k2 in x1]
+            target = {k2: (x1[k2].float() - x0[k2].float()) / span for k2 in keys}
+            move = sum(float(v.norm()) for v in target.values())
             if abs(span) < 1e-9 or move < 1e-9:
                 note(f"  {tr['image']} k={k}: empty segment "
                      f"(dt {span:.2e}, move {move:.2e}) - skipped")
@@ -222,10 +222,10 @@ def build_pairs(traces):
             pairs.append({
                 "image": tr["image"],
                 "k": k,
-                "state": x0,
+                "state": {k2: v for k2, v in x0.items()},
                 "t": ts[min(i, len(ts) - 1)],
                 "dt": span,
-                "target": (x1.float() - x0.float()) / span,
+                "target": target,
                 "cond": cond,
             })
     return pairs, grid
@@ -265,28 +265,36 @@ def build_pipeline():
     return pipe, flow
 
 
-def forward_velocity(model, state, t, cond):
+def forward_velocity(model, state_map, t, cond):
     """Call the flow module the way the sampler does.
 
     `t` is passed through untouched: the trace records what the module actually
     received, which is already the scaled convention (k0b's export adapter
-    multiplies by 1000, so the trace's t values sit in the thousands). Scaling
-    it again here would hand the model t=1e6 and teach it nothing.
+    multiplies by 1000, so the trace's t values sit in the hundreds-to-1000
+    range). Scaling it again would hand the model t=1e6 and teach it nothing.
     """
     t_in = torch.as_tensor([t], device=DEV, dtype=torch.float32)
-    out = model(state, t_in, cond)
-    v = state_latent(out)
-    return v if torch.is_tensor(v) else torch.as_tensor(v)
+    out = model(state_map, t_in, cond)
+    return as_map(out)
 
 
 def integrate(student, x0, t_values, dts, cond):
-    """Euler with the student's own predictions - the exact inference loop the
-    browser will run, in Python."""
-    x = x0
+    """Euler with the student's own predictions - the exact loop the browser
+    will run, written in Python first so a bug shows up here and not in WGSL."""
+    x = {k: v.to(DEV).float().clone() for k, v in x0.items()}
     for k in range(len(t_values)):
         v = forward_velocity(student, x, t_values[k], cond)
-        x = x + v.float() * dts[k]
+        for k2 in list(x):
+            if k2 in v:
+                x[k2] = x[k2] + v[k2].float() * dts[k]
     return x
+
+
+def to_dev(m):
+    """Trace states are stored as half to keep the files small; the student's
+    weights are fp32, and outside autocast an fp16 input against fp32 weights
+    fails on the elementwise ops."""
+    return {k: v.to(DEV).float() for k, v in m.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -300,10 +308,16 @@ def main():
     note(f"device {DEV}  student steps {S_STEPS}  epochs {EPOCHS}  lr {LR}  "
          f"accum {ACCUM}  dry {DRY}")
 
-    files = sorted(TRACE_DIR.glob("trace_*.pt"))
+    files = sorted(TRACE_DIR.glob("trace_*.pt")) if TRACE_DIR.is_dir() else []
     if not files:
-        raise RuntimeError(f"no traces in {TRACE_DIR}")
-    note(f"{len(files)} traces in {TRACE_DIR}")
+        # k2d ran in an earlier session; its output is attached as an input
+        # dataset, so the traces live under /kaggle/input, not here.
+        files = sorted(Path("/kaggle/input").glob("*/**/trace_*.pt"))
+        note(f"no traces in {TRACE_DIR}, found {len(files)} under /kaggle/input")
+    if not files:
+        raise RuntimeError(f"no traces in {TRACE_DIR} or under /kaggle/input")
+    note(f"{len(files)} traces")
+
     traces = []
     for f in files:
         try:
@@ -317,19 +331,22 @@ def main():
     states, ts, final = trajectory(first)
     note(f"states per image {len(states)}  distinct t {len(set(ts))}")
     note(f"t range {min(ts):.1f} .. {max(ts):.1f}")
-    note(f"latent shape {tuple(state_latent(states[0]).shape)}  "
-         f"dtype {state_latent(states[0]).dtype}")
-    note(f"n_calls {len(first['calls'])}  -> {len(states)} unique states "
-         f"({'CFG does 2 forwards/step' if len(first['calls']) > 2 * len(states) else 'flat'})")
+    for k, v in states[0].items():
+        note(f"  {k} {tuple(v.shape)} {v.dtype}")
+    note(f"n_calls {len(first['calls'])} -> {len(states)} unique states "
+         f"({'two forwards per step: CFG' if len(first['calls']) == 2 * len(states) else 'flat'})")
+    drift = max(float(states[i]["camera"].float().sub(
+        states[0]["camera"].float()).norm()) for i in range(len(states)))
+    note(f"camera drift over the trajectory {drift:.4f} "
+         f"(|camera| {float(states[0]['camera'].float().norm()):.4f}) "
+         f"- if this is not zero both channels have to be integrated")
 
     pairs, grid = build_pairs(traces)
     note(f"{len(pairs)} training pairs from {len(traces)} images")
-    R["pairs"] = [{"image": p["image"], "k": p["k"], "t": round(p["t"], 2),
-                   "dt": round(p["dt"], 6)} for p in pairs]
     if pairs:
-        mags = [p["target"].abs().mean().item() for p in pairs]
-        note(f"|v*| mean {sum(mags) / len(mags):.4f}  "
-             f"min {min(mags):.4f}  max {max(mags):.4f}")
+        mags = [float(p["target"]["latent"].abs().mean()) for p in pairs]
+        note(f"|v*| mean {sum(mags) / len(mags):.5f}  "
+             f"min {min(mags):.5f}  max {max(mags):.5f}")
 
     dt_by_k, t_by_k = {}, {}
     for p in pairs:
@@ -346,7 +363,8 @@ def main():
         "note": "frozen: the student only saw this grid, the browser must use it too",
     }
     (OUT / "grid.json").write_text(json.dumps(grid_json, indent=2))
-    note(f"grid {grid_json['t']}  dt {grid_json['dt']}")
+    note(f"grid t {grid_json['t']}")
+    note(f"grid dt {grid_json['dt']}")
 
     if DRY:
         note("dry run - stopping before any training")
@@ -354,37 +372,39 @@ def main():
         return
 
     pipe, teacher = build_pipeline()
-    note(f"teacher params {sum(p.numel() for p in teacher.parameters()) / 1e6:.1f} M")
-    student = copy.deepcopy(teacher)
+    note(f"teacher params {sum(p.numel() for p in teacher.parameters()) / 1e6:.1f} M  "
+         f"dtype {next(teacher.parameters()).dtype}")
+    student = copy.deepcopy(teacher).float()
     student.train()
     n_par = sum(p.numel() for p in student.parameters())
     note(f"student params {n_par / 1e6:.1f} M  fp32 Adam state ~{n_par * 12 / 1e9:.1f} GB")
 
+    # fp32 master weights matter more than they look. The pipeline hands over
+    # fp16 params, and fp16 carries about three decimal digits: at lr 5e-5 an
+    # update is ~1e-5 against weights of ~1e-2, which rounds to nothing.
+    # Autocast runs the matmuls in fp16 either way, so this costs memory only.
     opt = torch.optim.AdamW(student.parameters(), lr=LR, betas=(0.9, 0.95),
                             weight_decay=0.01)
-    # T4 is sm75: no bf16, so fp16 with a scaler. LayerNorm stays fp32 under
-    # autocast, which is the same reason dinov3 needed the fp32-stats fix.
-    scaler = torch.amp.GradScaler("cuda", enabled=(DEV.type == "cuda"))
-
-    def transfer(p):
-        return {k: (v.to(DEV) if torch.is_tensor(v) else v) for k, v in p["cond"].items()} \
-            if isinstance(p["cond"], dict) else p["cond"]
+    # T4 is sm75: no bf16 cores, so fp16 with a scaler. LayerNorm stays fp32
+    # under autocast, which is the same reason dinov3 needed the fp32-stats fix.
+    scaler = torch.amp.GradScaler(device="cuda", enabled=(DEV.type == "cuda"))
 
     t0 = time.time()
-    step = 0
     for epoch in range(EPOCHS):
         order = torch.randperm(len(pairs)).tolist()
         run_loss, run_n = 0.0, 0
         opt.zero_grad(set_to_none=True)
         for bi, idx in enumerate(order):
             p = pairs[idx]
-            state = {k: v.to(DEV) for k, v in p["state"].items()} \
-                if isinstance(p["state"], dict) else p["state"].to(DEV)
-            tgt = p["target"].to(DEV)
-            cond = transfer(p)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=(DEV.type == "cuda")):
+            state = to_dev(p["state"])
+            tgt = {k: v.to(DEV) for k, v in p["target"].items()}
+            cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
+                    for k, v in p["cond"].items()}
+            with torch.autocast("cuda", dtype=torch.float16,
+                                enabled=(DEV.type == "cuda")):
                 v = forward_velocity(student, state, p["t"], cond)
-                loss = torch.nn.functional.mse_loss(v.float(), tgt) / ACCUM
+                loss = sum(torch.nn.functional.mse_loss(
+                    v[k].float(), tgt[k]) for k in tgt if k in v) / ACCUM
             scaler.scale(loss).backward()
             run_loss += loss.item() * ACCUM
             run_n += 1
@@ -394,7 +414,6 @@ def main():
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
-                step += 1
         note(f"epoch {epoch:3d}  loss {run_loss / max(run_n, 1):.6f}  "
              f"{(time.time() - t0) / 60:.1f} min")
         R["training"].append({"epoch": epoch, "loss": run_loss / max(run_n, 1)})
@@ -407,16 +426,15 @@ def main():
         states, ts, final = trajectory(tr)
         if len(states) < 2:
             continue
-        cond = transfer({"cond": split_call(tr["calls"][0])[2]})
+        cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
+                for k, v in split_call(tr["calls"][0])[2].items()}
         x0 = states[0]
-        x0 = {k: v.to(DEV) for k, v in x0.items()} if isinstance(x0, dict) else x0.to(DEV)
         try:
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16,
                                                  enabled=(DEV.type == "cuda")):
                 xs = integrate(student, x0, grid_json["t"], grid_json["dt"], cond)
-            fin = final.to(DEV) if torch.is_tensor(final) else final
-            a = xs.float().flatten()
-            b = fin.float().flatten()
+            a = xs["latent"].float().flatten()
+            b = final["latent"].to(DEV).float().flatten()
             cos = torch.nn.functional.cosine_similarity(a, b, dim=0).item()
             rel = ((a - b).norm() / b.norm()).item()
             note(f"  {tr['image']}  cos {cos:.4f}  rel-l2 {rel:.3f}")
