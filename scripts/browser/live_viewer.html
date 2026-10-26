@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%231d1d1f'/></svg>">
+<title>flip live viewer</title>
+<style>
+  :root { --fg:#1d1d1f; --dim:#6b6b70; --panel:rgba(255,255,255,.82); --line:rgba(0,0,0,.10); }
+  html, body { margin:0; height:100%; overflow:hidden; background:#cfcfcf;
+               font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--fg); }
+  canvas { display:block; outline:none; }
+
+  #panel { position:fixed; left:14px; top:14px; width:250px; padding:12px 13px;
+           background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+           box-shadow:0 6px 24px rgba(0,0,0,.10); user-select:none; }
+  #panel h1 { margin:0 0 9px; font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--dim); font-weight:600; }
+  #panel select { width:100%; padding:5px 6px; font:inherit; font-size:12px; color:var(--fg);
+                  background:#fff; border:1px solid var(--line); border-radius:6px; }
+  .row { display:flex; align-items:center; gap:7px; margin-top:9px; }
+  .row .k { color:var(--dim); }
+  #angle { margin-left:auto; font-variant-numeric:tabular-nums; font-size:12px; }
+  #gauge { display:block; width:100%; height:26px; margin-top:9px; }
+  #hint { margin-top:9px; color:var(--dim); font-size:11px; line-height:1.6; }
+  #hint b { color:var(--fg); font-weight:600; }
+
+  #ref { position:fixed; right:14px; top:14px; width:158px; padding:8px;
+         background:var(--panel); border:1px solid var(--line); border-radius:10px;
+         backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); }
+  #ref img { width:100%; display:block; border-radius:5px; background:#000; }
+  #ref .cap { color:var(--dim); font-size:10px; margin-top:6px; text-align:center; }
+  body.hideref #ref { display:none; }
+
+  #status { position:fixed; left:50%; bottom:16px; transform:translateX(-50%);
+            color:var(--dim); font-size:11px; background:var(--panel); padding:4px 10px;
+            border-radius:20px; border:1px solid var(--line); }
+  #status.bad { color:#b3261e; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>flip · live</h1>
+  <select id="pick"></select>
+  <div class="row"><span class="k">az</span><span id="angle">0°</span></div>
+  <svg id="gauge" viewBox="0 0 224 26" preserveAspectRatio="none" aria-hidden="true">
+    <rect id="band" x="52" y="9" width="120" height="8" rx="4" fill="#1d7a3f" opacity=".16"></rect>
+    <line x1="112" y1="4" x2="112" y2="22" stroke="#1d1d1f" stroke-width="1" opacity=".28"></line>
+    <g id="ticks"></g>
+    <circle id="knob" cx="112" cy="13" r="4.5" fill="#1d1d1f"></circle>
+  </svg>
+  <div id="hint">
+    drag 转 · 滚轮 缩放<br>
+    <b>space</b> 自转 · <b>1–6</b> 0/45/90/135/180/270°<br>
+    <b>i</b> 输入图 · <b>f</b> 复位
+  </div>
+</div>
+<div id="ref"><img id="refimg" alt=""><div class="cap" id="refcap"></div></div>
+<div id="status">loading</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/three.module.js",
+    "@sparkjsdev/spark": "/vendor/spark.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const statusEl = document.getElementById("status");
+const pickEl = document.getElementById("pick");
+const angleEl = document.getElementById("angle");
+const knobEl = document.getElementById("knob");
+const bandEl = document.getElementById("band");
+const refEl = document.getElementById("ref");
+const refimg = document.getElementById("refimg");
+const refcap = document.getElementById("refcap");
+
+const say = (t, bad) => { statusEl.textContent = t; statusEl.classList.toggle("bad", !!bad); };
+
+// ---------------------------------------------------------------- scene
+const W = () => window.innerWidth, H = () => window.innerHeight;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xcfcfcf);
+const camera = new THREE.PerspectiveCamera(40, W() / H(), 0.001, 1000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(W(), H());
+document.body.appendChild(renderer.domElement);
+const spark = new SparkRenderer({ renderer });
+scene.add(spark);
+
+// The PLY is dumped in a Y-down frame; the shots flip it once. Keep that exact
+// transform so azimuth 0 here is the same view the contact sheets call az000.
+const FLIP = 1;
+const splatPivot = new THREE.Group();       // rotation.y = PI/2, matches viewer.html
+splatPivot.rotation.y = Math.PI / 2;
+const root = new THREE.Group();             // rotation.x = PI, the Y flip
+root.rotation.x = FLIP * Math.PI;
+root.add(splatPivot);
+scene.add(root);
+
+// ---------------------------------------------------------------- state
+const state = {
+  models: [], model: null, splat: null,
+  az: 0, el: 0, zoom: 1,          // live values
+  taz: 0, tel: 0, tzoom: 1,       // targets (eased toward)
+  spin: false, spinRate: 16,      // deg / s
+  ready: false,
+};
+const DEG = Math.PI / 180;
+
+function frameBasis() {
+  // centre / radius come from the PLY header, precomputed by serve.py
+  const c = new THREE.Vector3().fromArray(state.model.centre);
+  root.updateMatrixWorld(true);
+  c.applyMatrix4(splatPivot.matrixWorld);
+  return { c, radius: state.model.radius || 1 };
+}
+
+function placeCamera() {
+  if (!state.model) return;
+  const { c, radius } = frameBasis();
+  // 1.45 * 1.28 leaves the same margin the contact sheets had, at a comfortable
+  // size for a full window rather than a 900 px tile
+  const dist = radius * 2 * 1.45 * 1.28 * state.zoom;
+  const az = state.az * DEG, el = state.el * DEG;
+  camera.position.set(
+    c.x + Math.sin(az) * Math.cos(el) * dist,
+    c.y + Math.sin(el) * dist,
+    c.z + Math.cos(az) * Math.cos(el) * dist,
+  );
+  camera.lookAt(c);
+  camera.updateProjectionMatrix();
+}
+
+// ---------------------------------------------------------------- model load
+function load(m) {
+  if (state.splat) {
+    root.remove(state.splat);
+    try { state.splat.dispose && state.splat.dispose(); } catch (e) {}
+    state.splat = null;
+  }
+  state.model = m;
+  state.ready = false;
+  say("loading " + m.label);
+  const splat = new SplatMesh({
+    url: m.url,
+    onLoad: () => { state.ready = true; say(m.label + " · " + m.ply_mb + " MB"); },
+  });
+  splatPivot.add(splat);
+  state.splat = splat;
+
+  const ref = (m.refs || [])[0];
+  if (ref) { refimg.src = ref.url; refcap.textContent = ref.name; refEl.style.display = ""; }
+  else refEl.style.display = "none";
+
+  history.replaceState(null, "", "?m=" + encodeURIComponent(m.id));
+}
+
+// ---------------------------------------------------------------- input
+let drag = null;
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  drag = { x: e.clientX, y: e.clientY, az: state.taz, el: state.tel };
+  renderer.domElement.setPointerCapture(e.pointerId);
+  renderer.domElement.style.cursor = "grabbing";
+});
+addEventListener("pointerup", () => { drag = null; renderer.domElement.style.cursor = "grab"; });
+renderer.domElement.style.cursor = "grab";
+addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  state.taz = drag.az - (e.clientX - drag.x) * 0.42;
+  state.tel = Math.max(-80, Math.min(80, drag.el + (e.clientY - drag.y) * 0.30));
+  state.spin = false;
+});
+renderer.domElement.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  state.tzoom = Math.max(0.45, Math.min(2.6, state.tzoom * Math.exp(e.deltaY * 0.0011)));
+}, { passive: false });
+
+function jump(deg) { state.taz = deg; state.spin = false; }
+
+addEventListener("keydown", (e) => {
+  if (e.target.tagName === "SELECT") return;
+  const presets = [0, 45, 90, 135, 180, 270];
+  if (e.key === " ") { state.spin = !state.spin; e.preventDefault(); }
+  else if (e.key >= "1" && e.key <= "6") jump(presets[+e.key - 1]);
+  else if (e.key === "ArrowLeft") jump(state.taz - 15);
+  else if (e.key === "ArrowRight") jump(state.taz + 15);
+  else if (e.key === "i") document.body.classList.toggle("hideref");
+  else if (e.key === "f") { state.taz = 0; state.tel = 0; state.tzoom = 1; state.spin = false; }
+});
+
+// ---------------------------------------------------------------- gauge
+function drawGauge() {
+  const x = (az) => 112 + (az / 180) * 100;      // -180..180  ->  12..212
+  // the band is the ±60° window the K2c notes say survives a real photo
+  bandEl.setAttribute("x", x(-60));
+  bandEl.setAttribute("width", x(60) - x(-60));
+  for (const t of [-180, -90, 0, 90, 180]) {
+    knobEl.parentNode.querySelector("#t" + t)?.setAttribute("x1", x(t));
+  }
+  const a = ((state.az + 180) % 360 + 360) % 360 - 180;
+  knobEl.setAttribute("cx", x(a));
+  angleEl.textContent = Math.round(a) + "°";
+}
+(function ticks() {
+  const g = document.getElementById("ticks");
+  for (const t of [-180, -90, 0, 90, 180]) {
+    const l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    const x = 112 + (t / 180) * 100;
+    l.setAttribute("x1", x); l.setAttribute("y1", 5);
+    l.setAttribute("x2", x); l.setAttribute("y2", 21);
+    l.setAttribute("stroke", "#1d1d1f"); l.setAttribute("stroke-width", "1"); l.setAttribute("opacity", "0.18");
+    l.id = "t" + t;
+    g.appendChild(l);
+  }
+})();
+
+// ---------------------------------------------------------------- loop
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (state.spin) state.taz += state.spinRate * dt;
+
+  const k = 1 - Math.pow(0.0015, dt);       // frame-rate independent easing
+  state.az += (state.taz - state.az) * k;
+  state.el += (state.tel - state.el) * k;
+  state.zoom += (state.tzoom - state.zoom) * k;
+
+  placeCamera();
+  renderer.render(scene, camera);
+  drawGauge();
+  requestAnimationFrame(loop);
+}
+
+addEventListener("resize", () => {
+  camera.aspect = W() / H();
+  camera.updateProjectionMatrix();
+  renderer.setSize(W(), H());
+});
+
+// ---------------------------------------------------------------- boot
+(async () => {
+  const res = await fetch("/models.json");
+  const man = await res.json();
+  state.models = man.models;
+  for (const m of man.models) {
+    const o = document.createElement("option");
+    o.value = m.id; o.textContent = m.label;
+    pickEl.appendChild(o);
+  }
+  pickEl.addEventListener("change", () => {
+    const m = state.models.find(x => x.id === pickEl.value);
+    if (m) load(m);
+  });
+  const want = new URLSearchParams(location.search).get("m");
+  const first = state.models.find(x => x.id === want) || state.models[0];
+  pickEl.value = first.id;
+  load(first);
+  requestAnimationFrame(loop);
+  // headless probes wait on this
+  setTimeout(() => { document.title = "READY"; }, 500);
+})();
+</script>
+</body>
+</html>
