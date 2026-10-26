@@ -58,12 +58,18 @@ def save():
 # a renderer just good enough to judge silhouettes
 # ---------------------------------------------------------------------------
 
-def render(g, size=256, azimuth_deg=0.0, elev_deg=0.0, zoom=1.35):
-    """Orthographic splat. Painter's algorithm by depth, alpha from opacity."""
+def render(g, size=256, azimuth_deg=0.0, elev_deg=0.0, zoom=1.35, max_radius=6.0):
+    """Orthographic splat. Painter's algorithm by depth, alpha from opacity.
+
+    Radius is clamped: the decoded scales have a tail, and an unclamped point
+    with a large scale paints a disc across the whole frame (and, in a grid,
+    across the cells next to it). Clamping keeps an outlier to one blob
+    instead of one quadrant.
+    """
     xyz = g.get_xyz.detach().float().cpu().numpy()
-    op = g.get_opacity.detach().float().cpu().numpy().reshape(-1)
-    sc = g.get_scaling.detach().float().cpu().numpy().mean(axis=1)
-    dc = g._features_dc.detach().float().cpu().numpy().reshape(-1, 3)
+    op = np.nan_to_num(g.get_opacity.detach().float().cpu().numpy().reshape(-1), nan=0.0)
+    sc = np.nan_to_num(g.get_scaling.detach().float().cpu().numpy().mean(axis=1), nan=0.0)
+    dc = np.nan_to_num(g._features_dc.detach().float().cpu().numpy().reshape(-1, 3), nan=0.0)
     rgb = np.clip(0.5 + SH_C0 * dc, 0.0, 1.0)
 
     a = np.deg2rad(azimuth_deg)
@@ -76,15 +82,15 @@ def render(g, size=256, azimuth_deg=0.0, elev_deg=0.0, zoom=1.35):
 
     px = (x * zoom + 0.5) * size
     py = (0.5 - y * zoom) * size
-    rad = np.maximum(sc * zoom * size * 0.6, 0.7)
+    rad = np.clip(sc * zoom * size * 0.6, 0.7, max_radius)
 
-    order = np.argsort(-depth)  # far first
+    keep = ((px > -8) & (px < size + 8) & (py > -8) & (py < size + 8)
+            & (op > 0.02))
+    order = np.argsort(-depth[keep])
     img = Image.new("RGBA", (size, size), (255, 255, 255, 255))
     d = ImageDraw.Draw(img, "RGBA")
-    for i in order:
+    for i in np.nonzero(keep)[0][order]:
         r = float(rad[i])
-        if not (0.0 <= px[i] <= size and 0.0 <= py[i] <= size) and r < 2:
-            continue
         col = (int(rgb[i, 0] * 255), int(rgb[i, 1] * 255), int(rgb[i, 2] * 255),
                int(np.clip(op[i], 0.0, 1.0) * 255))
         d.ellipse([px[i] - r, py[i] - r, px[i] + r, py[i] + r], fill=col)
@@ -133,8 +139,11 @@ def main():
 
     # a subject with a clear silhouette; the repo's own examples are the least
     # likely to be out of distribution
-    cands = [p for p in sorted((REPO / "static").rglob("*"))
-             if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
+    ex = REPO / "static" / "example_inputs"
+    cands = sorted(p for p in ex.glob("*") if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"))
+    if not cands:
+        cands = [p for p in sorted((REPO / "static").rglob("*"))
+                 if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
     note(f"candidate images: {[p.name for p in cands]}")
     img_path = cands[0]
     note(f"using {img_path}")
@@ -145,6 +154,7 @@ def main():
     prepared = pipe.preprocess_image(image)
     R["preprocess_s"] = round(time.time() - t0, 2)
     note(f"preprocess {R['preprocess_s']}s  size {prepared.size}")
+    prepared.resize((256, 256)).save(OUT / "input.png")
 
     gen = torch.Generator(device=DEV).manual_seed(SEED)
     t0 = time.time()
@@ -185,6 +195,10 @@ def main():
             })
             for az in (0, 90, 180, 270):
                 renders[(steps, az)] = render(g, azimuth_deg=az)
+            cov = {az: round(float(silhouette(renders[(steps, az)]).mean()), 4)
+                   for az in (0, 90, 180, 270)}
+            run["coverage"] = cov
+            note(f"  coverage: {cov}")
             # quantitative shape drift against the 20-step baseline
             if steps != 20:
                 base = R["runs"].get("20") or {}
@@ -219,6 +233,7 @@ def main():
         for c_i, az in enumerate((0, 90, 180, 270)):
             im = renders.get((steps, az))
             if im is not None:
+                im.save(OUT / f"r{steps:02d}_{az:03d}.png")
                 grid.paste(im, (label_w + c_i * cell, r_i * cell))
             d.text((label_w + c_i * cell + 6, r_i * cell + 6), f"{az}deg",
                    fill=(120, 120, 120))
