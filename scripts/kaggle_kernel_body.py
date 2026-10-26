@@ -60,10 +60,23 @@ log(run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
 # ---------------------------------------------------------------------------
 # 1. deps
 # ---------------------------------------------------------------------------
-run([sys.executable, "-m", "pip", "install", "-q",
-     "onnx", "onnxscript", "onnxruntime-gpu"])
+# onnxruntime-gpu on PyPI is built against one CUDA major at a time, and the
+# current wheel wants CUDA 13 while this image ships CUDA 12.8. Left unpinned
+# it installs cleanly, then fails at session creation with
+#   libcublasLt.so.13: cannot open shared object file
+# and silently falls back to CPU - which is how a 370 M DiT got OOM-killed.
+run([sys.executable, "-m", "pip", "install", "-q", "onnx", "onnxscript"])
+r = run([sys.executable, "-m", "pip", "install", "-q", "onnxruntime-gpu==1.22.0"])
+if r.returncode != 0:
+    log("pinned onnxruntime-gpu==1.22.0 failed, falling back to unpinned")
+    run([sys.executable, "-m", "pip", "install", "-q", "onnxruntime-gpu"])
 run([sys.executable, "-m", "pip", "install", "-q",
      "safetensors", "pillow", "tqdm", "huggingface_hub"])
+try:
+    import onnxruntime as _ort
+    log(f"onnxruntime {_ort.__version__} providers={_ort.get_available_providers()}")
+except Exception:  # noqa: BLE001
+    log("onnxruntime import failed")
 log("pip done")
 
 # ---------------------------------------------------------------------------

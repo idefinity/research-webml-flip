@@ -86,12 +86,19 @@ class DinoAdapter(nn.Module):
         return out
 
 
-def ort_check(name, path, args, ref, time_it=False):
+def ort_check(name, path, args, ref, time_it=False, allow_cpu=True):
     import onnxruntime as ort
 
     try:
         avail = ort.get_available_providers()
         provs = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
+        if not provs:
+            raise RuntimeError(f"no execution provider in {avail}")
+        if not allow_cpu and provs[0] == "CPUExecutionProvider":
+            note(f"  [{name}] skip verify: only CPU EP available ({avail}); "
+                 f"running this graph on CPU gets the process OOM-killed")
+            return {"ok": False, "skipped": True,
+                    "err": f"CUDA EP unavailable, providers={avail}"}
         t0 = time.time()
         sess = ort.InferenceSession(path, providers=provs)
         load_s = time.time() - t0
@@ -196,14 +203,17 @@ def probe_dit(flow):
         note(traceback.format_exc()[-2500:])
     torch.cuda.empty_cache()
 
-    # 1c. ONNX, dynamo first (no symbolic_trace involved)
-    for tag, kw in (("dynamo", {"dynamo": True}), ("ts", {"dynamo": False})):
+    # 1c. ONNX, dynamo first (no symbolic_trace involved).
+    # opset 18: the dynamo exporter has no 17 kernels and will emit 18 anyway,
+    # then spend ten seconds failing to version-convert it back down.
+    for tag, kw in (("dynamo", {"dynamo": True, "opset_version": 18}),
+                    ("ts", {"dynamo": False, "opset_version": 17})):
         path = OUT / f"flow_dit.{tag}.onnx"
         note(f"  exporting via {tag} ...")
         t0 = time.time()
         try:
             with torch.no_grad():
-                torch.onnx.export(fa, tuple(args), str(path), opset_version=17,
+                torch.onnx.export(fa, tuple(args), str(path),
                                   do_constant_folding=True, **kw)
         except Exception:  # noqa: BLE001
             R["dit"][f"onnx_{tag}_ok"] = False
@@ -216,6 +226,13 @@ def probe_dit(flow):
         mb = path.stat().st_size / 1e6
         ext = list(OUT.glob(f"flow_dit.{tag}.onnx.data"))
         ext_mb = sum(p.stat().st_size for p in ext) / 1e6
+        try:
+            import onnx  # noqa: PLC0415
+            _m = onnx.load(str(path), load_external_data=False)
+            R["dit"][f"onnx_{tag}_opset"] = _m.opset_import[0].version
+            note(f"  {tag} opset {_m.opset_import[0].version}")
+        except Exception:  # noqa: BLE001
+            pass
         R["dit"][f"onnx_{tag}_ok"] = True
         R["dit"][f"onnx_{tag}_mb"] = round(mb, 1)
         R["dit"][f"onnx_{tag}_data_mb"] = round(ext_mb, 1)
@@ -223,7 +240,9 @@ def probe_dit(flow):
         note(f"  {tag} ok  {mb:.1f} MB (+{ext_mb:.0f} MB external data)  {secs:.1f}s")
         with torch.no_grad():
             R["dit"][f"ort_{tag}"] = ort_check(f"flow_dit/{tag}", str(path),
-                                               args, ref, time_it=True)
+                                               args, ref, time_it=True,
+                                               allow_cpu=False)
+        (OUT / "report.json").write_text(json.dumps(R, indent=2))
         torch.cuda.empty_cache()
 
 
@@ -281,15 +300,15 @@ def probe_dino_fp16(dino):
         note(traceback.format_exc()[-1200:])
         return
 
-    for tag, kw in (("dynamo", {"dynamo": True}), ("ts", {"dynamo": False})):
+    for tag, kw in (("dynamo", {"dynamo": True, "opset_version": 18}),
+                    ("ts", {"dynamo": False, "opset_version": 17})):
         path = OUT / f"dinov3_fp16.{tag}.onnx"
         note(f"  exporting {tag} ...")
         t0 = time.time()
         try:
             with torch.no_grad():
                 torch.onnx.export(DinoAdapter(dino).eval(), tuple(args_fp16),
-                                  str(path), opset_version=17,
-                                  do_constant_folding=True, **kw)
+                                  str(path), do_constant_folding=True, **kw)
         except Exception:  # noqa: BLE001
             R["dinov3"][f"onnx_{tag}_ok"] = False
             R["dinov3"][f"onnx_{tag}_err"] = traceback.format_exc()[-1500:]
@@ -303,7 +322,8 @@ def probe_dino_fp16(dino):
         note(f"  {tag} ok  {mb:.1f} MB (+{ext:.0f} MB ext)  {time.time() - t0:.1f}s")
         with torch.no_grad():
             R["dinov3"][f"ort_{tag}"] = ort_check(
-                f"dinov3/{tag}", str(path), args_fp16, ref16)
+                f"dinov3/{tag}", str(path), args_fp16, ref16, allow_cpu=False)
+        (OUT / "report.json").write_text(json.dumps(R, indent=2))
         torch.cuda.empty_cache()
 
 
