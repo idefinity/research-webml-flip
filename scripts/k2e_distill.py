@@ -44,6 +44,7 @@ Env:
 """
 
 import copy
+import gc
 import json
 import os
 import sys
@@ -64,7 +65,8 @@ DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 S_STEPS = int(os.environ.get("FLIP_STEPS", "4"))
 EPOCHS = int(os.environ.get("FLIP_EPOCHS", "40"))
 LR = float(os.environ.get("FLIP_LR", "5e-5"))
-ACCUM = int(os.environ.get("FLIP_ACCUM", "4"))
+ACCUM = int(os.environ.get("FLIP_ACCUM", "1"))
+SAVE_EVERY = int(os.environ.get("FLIP_SAVE_EVERY", "4"))
 DRY = os.environ.get("FLIP_DRY", "0") == "1"
 
 R = {"notes": [], "training": [], "eval": []}
@@ -374,6 +376,16 @@ def main():
     pipe, teacher = build_pipeline()
     note(f"teacher params {sum(p.numel() for p in teacher.parameters()) / 1e6:.1f} M  "
          f"dtype {next(teacher.parameters()).dtype}")
+    # The pipeline was only a way to construct the DiT with the right weights.
+    # DINOv3, the VAE, RMBG and the decoder are several GB of fp16 on the card
+    # and are dead weight for the next three hours, so give the memory back
+    # before allocating fp32 master weights and Adam state.
+    del pipe
+    gc.collect()
+    if DEV.type == "cuda":
+        torch.cuda.empty_cache()
+        note(f"freed the pipeline: {torch.cuda.memory_allocated() / 1e9:.2f} GB still live, "
+             f"{torch.cuda.mem_get_info()[0] / 1e9:.2f} GB free")
     student = copy.deepcopy(teacher).float()
     student.train()
     n_par = sum(p.numel() for p in student.parameters())
@@ -389,23 +401,38 @@ def main():
     # under autocast, which is the same reason dinov3 needed the fp32-stats fix.
     scaler = torch.amp.GradScaler(device="cuda", enabled=(DEV.type == "cuda"))
 
+    def dump(tag="student.pt"):
+        torch.save({"model": student.state_dict(), "grid": grid_json,
+                    "s_steps": S_STEPS}, OUT / tag)
+        note(f"  saved {tag} {(OUT / tag).stat().st_size / 1e9:.2f} GB")
+
     t0 = time.time()
     for epoch in range(EPOCHS):
         order = torch.randperm(len(pairs)).tolist()
-        run_loss, run_n = 0.0, 0
+        run_loss, run_n, skipped = 0.0, 0, 0
         opt.zero_grad(set_to_none=True)
         for bi, idx in enumerate(order):
             p = pairs[idx]
-            state = to_dev(p["state"])
-            tgt = {k: v.to(DEV) for k, v in p["target"].items()}
-            cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
-                    for k, v in p["cond"].items()}
-            with torch.autocast("cuda", dtype=torch.float16,
-                                enabled=(DEV.type == "cuda")):
-                v = forward_velocity(student, state, p["t"], cond)
-                loss = sum(torch.nn.functional.mse_loss(
-                    v[k].float(), tgt[k]) for k in tgt if k in v) / ACCUM
-            scaler.scale(loss).backward()
+            try:
+                state = to_dev(p["state"])
+                tgt = {k: v.to(DEV) for k, v in p["target"].items()}
+                cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
+                        for k, v in p["cond"].items()}
+                with torch.autocast("cuda", dtype=torch.float16,
+                                    enabled=(DEV.type == "cuda")):
+                    v = forward_velocity(student, state, p["t"], cond)
+                    loss = sum(torch.nn.functional.mse_loss(
+                        v[k].float(), tgt[k]) for k in tgt if k in v) / ACCUM
+                scaler.scale(loss).backward()
+            except torch.cuda.OutOfMemoryError:
+                # A three-hour run should not end because one sample was the
+                # first to tip the allocator over. Drop the sample's gradients
+                # and carry on; the count is reported so it is visible.
+                skipped += 1
+                opt.zero_grad(set_to_none=True)
+                if DEV.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
             run_loss += loss.item() * ACCUM
             run_n += 1
             if (bi + 1) % ACCUM == 0:
@@ -415,9 +442,12 @@ def main():
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
         note(f"epoch {epoch:3d}  loss {run_loss / max(run_n, 1):.6f}  "
-             f"{(time.time() - t0) / 60:.1f} min")
-        R["training"].append({"epoch": epoch, "loss": run_loss / max(run_n, 1)})
+             f"skipped {skipped}  {(time.time() - t0) / 60:.1f} min")
+        R["training"].append({"epoch": epoch, "loss": run_loss / max(run_n, 1),
+                              "skipped": skipped})
         save()
+        if SAVE_EVERY and (epoch + 1) % SAVE_EVERY == 0:
+            dump(f"student_e{epoch + 1:03d}.pt")
 
     student.eval()
     note("=" * 72)

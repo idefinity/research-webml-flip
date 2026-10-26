@@ -33,6 +33,8 @@ Env:
   FLIP_SHARD       "i/n" - trace one shard, see above
   FLIP_FORK        "auto" (default) | "0" - two-GPU coordination on or off
   FLIP_FORK_MIN_GB refuse to fork below this much free RAM (default 16)
+  FLIP_FETCH_N     download this many photos if the inputs are short (default 0)
+  FLIP_FETCH_TPL   url template with {s} seed and {size} px (default picsum)
 """
 
 import hashlib
@@ -42,6 +44,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.request
 from pathlib import Path
 
 import torch
@@ -62,6 +65,10 @@ SHIFT = float(os.environ.get("FLIP_TRACE_SHIFT", "3.0"))
 SHARD = os.environ.get("FLIP_SHARD", "").strip()
 FORK = os.environ.get("FLIP_FORK", "auto").strip().lower()
 FORK_MIN_GB = float(os.environ.get("FLIP_FORK_MIN_GB", "16"))
+FETCH_N = int(os.environ.get("FLIP_FETCH_N", "0"))
+FETCH_TPL = os.environ.get(
+    "FLIP_FETCH_TPL", "https://picsum.photos/seed/{s}/{size}").strip()
+FETCH_SIZE = int(os.environ.get("FLIP_FETCH_SIZE", "512"))
 SEED = 42
 
 # Tensors below this size stay inline; above it they get deduplicated. cond
@@ -357,14 +364,53 @@ def unwrap(rec):
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 
+def fetch_photos(n):
+    """Download n photos when nothing is attached.
+
+    Attaching a Kaggle dataset through the API turns out to be silently
+    ignored - /kaggle/input exists and is empty, so the run that was supposed
+    to trace 64 COCO images traced the same four repo examples again. The
+    kernel has working internet instead (probed: picsum returns a JPEG in
+    0.4 s), so the inputs come over HTTP.
+
+    Files are cached by seed, which matters because the two GPU workers each
+    call this and would otherwise download the same set twice.
+    """
+    dst = WORK / "inputs"
+    dst.mkdir(parents=True, exist_ok=True)
+    got = []
+    for s in range(1, n + 1):
+        path = dst / f"photo_{s:04d}.jpg"
+        if path.exists() and path.stat().st_size > 1024:
+            got.append(path)
+            continue
+        url = FETCH_TPL.format(s=s, size=FETCH_SIZE)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "flip-trace"})
+            with urllib.request.urlopen(req, timeout=45) as fh:
+                blob = fh.read()
+            if blob[:2] != b"\xff\xd8":
+                note(f"  seed {s}: not a jpeg ({len(blob)} bytes) - skipped")
+                continue
+            # atomic: the two gpu workers download concurrently and would
+            # otherwise race each other on a half-written file
+            tmp = path.with_suffix(".jpg.part")
+            tmp.write_bytes(blob)
+            os.replace(tmp, path)
+            got.append(path)
+        except Exception:  # noqa: BLE001
+            note(f"  seed {s}: fetch failed ({type(sys.exc_info()[1]).__name__})")
+    note(f"fetched {len(got)} photos of {n} from {FETCH_TPL}")
+    return got
+
+
 def pick_images():
-    """Repo examples first, then FLIP_IMAGE_DIR if it points somewhere.
+    """Repo examples first, then FLIP_IMAGE_DIR, then HTTP if still short.
 
     The upstream repo ships four example inputs and no more, which is not
     enough to distill on - four objects means four distinct conditioning
     features, and the student can latch onto those instead of learning the
-    straightening. Anything attached as a Kaggle dataset lands under
-    /kaggle/input and can be pointed at here.
+    straightening.
     """
     cands = []
     ex = REPO / "static" / "example_inputs"
@@ -384,6 +430,9 @@ def pick_images():
             found = [root]
         note(f"FLIP_IMAGE_DIR {extra}: {len(found)} images")
         cands += found
+
+    if len(cands) < N_IMG and FETCH_N:
+        cands += fetch_photos(min(FETCH_N, N_IMG - len(cands)))
     return cands[:N_IMG]
 
 
