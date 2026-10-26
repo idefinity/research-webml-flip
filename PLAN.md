@@ -126,9 +126,22 @@ TRELLIS.2 吐的是**带 PBR 的网格**，不是高斯。而"手办感"这个�
 
 ---
 
-## K0 实测（已完成，T4 / torch 2.11）
+## K0 实测（T4 / torch 2.11）
 
-Kaggle：`kkonda/flip-k0-onnx-probe`，v3 与 v4 两轮。TripoSplat @ `d8db9e0`，权重 `VAST-AI/TripoSplat`，磁盘 4.2 GB。v4 起 kernel 里只有一行 SHA，代码从 `scripts/` 取。
+TripoSplat @ `d8db9e0`，权重 `VAST-AI/TripoSplat`，磁盘 4.2 GB。每个探针一个 Kaggle kernel，kernel 里只有一段 bootstrap，真正的代码按 SHA 从 `scripts/` 取。
+
+| 探针 | 内核 | 回答了 |
+|---|---|---|
+| K0 | `flip-k0-onnx-probe` | 参数量、延迟、五个模块能不能导出、ORT vs eager 的 cosine |
+| K0b | 同上 | DiT 只能走 dynamo；导出链是通的 |
+| K0c | 同上 | 小模型逐段导出全部 1.0000 → 架构无辜 |
+| K0d | 同上 | fp32 1.0003 / fp16 0.075 → 是精度，不是结构 |
+| K0e | 同上 | 残差峰值 33,603，不溢出；ablation 设计无效 |
+| K0f | `flip-k0f-which-op` | **病灶 = 逐 token 的 LayerNorm 方差，修法 = fp32 统计** |
+| K0g | `flip-k0g-dino-export-fixed` | 修法能不能活着进图（cosine ≥ 0.999） |
+| K2a | `flip-k2a-step-quality` | 4 步可用、2 步崩、IoU 会骗人 |
+
+下面按结论排，不按时间排。
 
 ### 参数量
 
