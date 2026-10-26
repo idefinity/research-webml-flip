@@ -152,9 +152,54 @@ Type 'tensor(bfloat16)' of input parameter ... is an invalid model
 
 v3 里 `flow_dit` 报 `Proxy object cannot be iterated`，我把账记在模型的 dict 输入上。这个归因错了，证据是：同一个模块在 `sample_latent` 里被 eager 跑了 20 次，全程正常。
 
-真实机制：探针先对适配层调 `torch.fx.symbolic_trace`，它抛异常，然后**同一个模块接着做 eager 调用，报的是一模一样的 Proxy 错误**。失败的 trace 把模块留在了不可用的状态，探针污染了自己的对照组。
+真实机制：探针先对适配层调 `torch.fx.symbolic_trace`，它抛异常，然后**同一个模块接着做 eager 调用，报的是一模一样的 Proxy 错误**。失败的 trace 把模块留在不可用的状态，探针污染了自己的对照组。
 
 教训写进脚本了：**eager 基准必须在任何 trace 之前取**，DiT 不走 symbolic_trace。
+
+### DiT 能导出，但只能走 dynamo（K0b）
+
+把 trace 摘掉之后，DiT 的 eager 2.6 秒跑通，`torch.onnx.export(dynamo=True)` 用 93 秒导出了 5.5 MB 的图加 742 MB 外部权重。
+
+`torch.export` 和 fx 路径依然失败，原因这次很具体，写在 `model.py:1664`：
+
+```python
+h_x = block(h_x, mod=t_mod, rotary_emb=self.noise_repo_layers[i](h_x))
+```
+
+模型用 `mod=` 当关键字参数名。fx 的 `module_call_wrapper` 自己的形参也叫 `mod`，两边撞上：
+
+```
+TypeError: Module._wrapped_call_impl() got multiple values for argument 'mod'
+```
+
+这是**命名冲突，不是控制流**。改模型源码当然能绕（把 `mod=` 改名），但我们不打算维护上游分支。dynamo 走的是 `torch.export` 的 strict 路径，不经过这套 wrapper，所以能过。
+
+结论：**这条转换链的唯一起点是 `dynamo=True`**，别在 TorchScript 上浪费时间。opset 用 18——dynamo 没有 17 的算子实现，要 17 它会先生成 18，再花十秒尝试降级然后失败。
+
+### K0b 结果：五个模块全部可导出，但有一个没验干净
+
+| 模块 | 导出 | 体积 | ORT 数值 |
+|---|---|---|---|
+| flow_dit | dynamo ✅ / ts ❌ | 5.5 MB + 742 MB | 未验（OOM） |
+| dinov3（转 fp16） | dynamo ✅ / ts ✅ | 1682 MB | **cos 0.076 ❌** |
+| vae_encoder | 见 K0 v4 | 69 MB | 未验 |
+| gs_decoder | ts ✅ | 476 MB | cos 1.000093 ✅ |
+| octree_level | ts ✅ | 102 MB | cos 0.999996 ✅ |
+
+**1. 把 bf16 换成 fp16 几乎不要钱。** dinov3 转 fp16 后和 bf16 的输出：`max_abs 0.094`、`mean_abs 0.0014`、`cos 0.999939`。所以“编码器必须转 fp16”这条约束的成本可以忽略。
+
+**2. DiT 的 ORT 校验没做成。** 不是模型的问题：ORT 分配 CUDA 缓冲区时请求 4.8 GB，而 PyTorch 那一整套管线还占着显存，直接 OOM。修法是把 ORT 校验放进独立 session，或者在量化之后再做（INT4 小得多）。放在 K1 一起做更省事。
+
+**3. dinov3 的数值对不上，这条必须查清再往下走。**
+导出的图能加载、能跑，但输出和 eager 完全不是一回事：`cosine 0.075984`、`mean_abs 0.143`。关键在于 **ts 和 dynamo 两条独立路径报出一模一样的数字**——同一个错法，说明它是系统性的，不是精度问题。
+
+三个候选原因，按可能性排：位置编码插值被常量折叠成了别的分辨率；导出图多出/少了输入导致 `zip` 悄悄错位；forward 里返回的分支（pooler / last_hidden）在两侧选得不一样。
+
+**在 K1 量化之前必须先把这个 cosine 拉回 0.999 以上。** 量化会把误差叠加上去，带着一个 cos 0.076 的编码器去量化，等于在测噪声。这条已经写进 Gate 1。
+
+### fp16 ONNX 总量（全五个模块）
+
+1682 + 742 + 476 + 102 + 69 = **3071 MB**。这是没有量化的起点，距离 900 MB 的 INT4 目标还差一个 4-bit 量化加一个 2–4 步蒸馏。
 
 ### ONNX 总量（fp16，未量化）
 
@@ -210,6 +255,7 @@ cast 这一步是 K0 逼出来的，不是可选项：dinov3 和 flux2 VAE 是�
 
 ### Gate 1
 
+- **每个导出模块的 ORT 输出与 eager 的 cosine ≥ 0.999**（当前 gs_decoder / octree_level 达标，dinov3 是 0.076，不过这条不许进下一阶段）
 - 正面视角与输入图的 **SSIM ≥ 0.55**（初值，跑完 20 张再标定）
 - 转到背面的过程中，连续 3 秒内不出现大面积透明或穿模
 - 连续 20 次生成，**0 次 device lost**
@@ -298,11 +344,11 @@ K0 之前，kernel 里塞着整份探测代码（两千行）。那和 paste.rs 
 
 | Notebook | 机器 | 干什么 | 状态 |
 |---|---|---|---|
-| `flip-k0-onnx-probe` | T4 | 参数量 + 逐模块 ONNX 探测 + 数值校验 | v3 跑了参数量/延迟；v4 修 bug 后重跑 |
+| `flip-k0-onnx-probe` | T4 | 参数量 + 逐模块 ONNX 探测 + 数值校验 | v7 跑完：五模块全部可导出，dinov3 数值待修 |
 | `flip-k2-step-distill` | T4 | flow matching 步数蒸馏，目标 2–4 步（**必做**） | 待写 |
 | `flip-k1-quantize-bundle` | CPU | INT4 + 打包 + onnxruntime 数值校验 + 传 HF | 待写 |
 
-原来的 `flip-k0b-export-fix` 取消了。两个导出 bug 都在脚本里，改脚本比开新 kernel 干净——这也是把代码搬进仓库之后第一个直接的好处。
+kernel 现在是 v7，正文只有一行 SHA。K0b 没有另开 notebook——两个导出 bug 都在脚本里，改脚本比开新 kernel 干净。
 
 ### 相对你 Ming 那套要改三个地方
 
@@ -383,6 +429,7 @@ K0 之前，这条链路被写成“K1 出来之后浏览器端仍然 > 20 秒�
 | 蒸馏到 4 步后质量塌 | 中高 | 质量 | 先验 8 步作为中间档；Ming 那套 flow distillation 的经验直接搬 |
 | INT4 静默回落到 CPU | 中 | 性能崩 | 导出后逐节点验证 EP |
 | 真人肖像的合规问题 | 中 | 下架 | 水印 + 使用声明 + 下架通道 |
+| **ONNX 图能加载、能跑、算错** | 中 | 静默毁掉质量 | 每个模块导出后强制 ORT vs eager 校验，cosine ≥ 0.999 才算过；dinov3 现在就卡在这 |
 | ~~八叉树采样器无法 ONNX 化~~ | ~~中高~~ | — | **已证伪**：逐层导出成功，只有一处 host sync |
 
 ---
@@ -400,9 +447,9 @@ K0 之前，这条链路被写成“K1 出来之后浏览器端仍然 > 20 秒�
 
 ## 下一步做什么
 
-1. **K0b**：修 DiT 适配层（dict pytree）+ 用模块自身的 bf16 转 fp16 重新导出 dinov3 / VAE。目标是五个模块全部 ONNX 落地、端到端数值对齐。这是阶段 1 的入场券。
-2. **K2 提前**：DiT 的 20 步已经判死刑，蒸馏是主线而不是支线。先把 8 步做出来当中间档，再往 4 步压。
-3. **阶段 0 浏览器验证**：打开 SpawnDev.ILGPU.ML 的 LGM demo，拖一张真人背影进去，看它出什么。这一步仍然决定产品成不成立，而且和 K0b/K2 完全并行——两条线没有依赖，别串行。
+1. **把 dinov3 的 cosine 从 0.076 拉到 0.999。** 这是现在唯一挡路的技术问题，也是最便宜的一个：三个候选原因（位置编码插值、输入错位、返回分支）都能在一次 session 里排除，因为图已经能跑，只是算错。
+2. **K2 提前**：DiT 的 20 步已经判死刑，蒸馏是主线不是支线。先做 8 步当中间档，再往 4 步压。导出链已验证（dynamo / opset 18），蒸馏出来的模型可以直接套同一个导出脚本。
+3. **阶段 0 浏览器验证**：打开 SpawnDev.ILGPU.ML 的 LGM demo，拖一张真人背影进去，看它出什么。这一步仍然决定产品成不成立，而且和上面两条完全并行——没有依赖，别串行。
 
 ---
 
