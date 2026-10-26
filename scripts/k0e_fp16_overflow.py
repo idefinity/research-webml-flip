@@ -69,11 +69,15 @@ def save():
 
 
 def cos(a, b):
-    return round(F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item(), 6)
+    a = (a.detach() if torch.is_tensor(a) else torch.as_tensor(a)).float().cpu()
+    b = (b.detach() if torch.is_tensor(b) else torch.as_tensor(b)).float().cpu()
+    return round(F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item(), 6)
 
 
 def per_token(a, b):
-    c = F.cosine_similarity(a.float()[0], b.float()[0], dim=-1)
+    a = (a.detach() if torch.is_tensor(a) else torch.as_tensor(a)).float().cpu()
+    b = (b.detach() if torch.is_tensor(b) else torch.as_tensor(b)).float().cpu()
+    c = F.cosine_similarity(a[0], b[0], dim=-1)
     return {"prefix": [round(v, 6) for v in c[:5].tolist()],
             "patch_mean": round(c[5:].mean().item(), 6)}
 
@@ -197,6 +201,11 @@ def main():
         h.remove()
     note(f"  fp32 block max|x|: first {rec32[0][1]:.0f}  peak "
          f"{max(r[1] for r in rec32):.0f}  last {rec32[-1][1]:.0f}")
+    top = sorted(rec32, key=lambda r: -r[1])[:5]
+    note("  fp32 loudest blocks: "
+         + ", ".join(f"#{k}={v:.0f}" for k, v, _ in top))
+    note(f"  fp16 ceiling {FP16_MAX:.0f}; headroom at fp32 peak = "
+         f"{FP16_MAX / max(r[1] for r in rec32):.2f}x")
     R["fp32_blocks"] = {"peak": round(max(r[1] for r in rec32), 1),
                         "first": round(rec32[0][1], 1),
                         "last": round(rec32[-1][1], 1)}

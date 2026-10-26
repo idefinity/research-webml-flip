@@ -217,6 +217,23 @@ TypeError: Module._wrapped_call_impl() got multiple values for argument 'mod'
 
 还剩两个变量是小模型区分不了的：**fp16**，和**深度（32 层 / 4101 token）**。K0d 用真实权重跑 fp32 对照，再加一个最近邻归属表（每个导出 patch token 实际最像哪个 eager token）——恒等就意味着值算错了，错位就意味着布局错了，两者的修法完全不同。
 
+### K0d：图是对的，fp16 算错了
+
+真实权重，同一份输入，只是一个跑 fp32、一个跑 fp16：
+
+| 精度 | cosine | prefix token | patch token |
+|---|---|---|---|
+| fp32 | **1.0003** | 1.0 | 1.0 |
+| fp16 | 0.0750 | 0.99999（除 token 2 = -0.04） | 0.0676 |
+
+**结论：导出链路没有问题，fp16 算术有问题。** 同一个导出器、同一份权重、同一个输入，换精度就从 1.0003 掉到 0.075。
+
+第二个数把"错"量化了：这个模型里**两个无关 patch token 之间的 cosine 是 0.42**，而导出的 patch token 只有 0.067——**低于"完全无关"的水平**。它们不是偏了，是塌了。最近邻归属表也印证：identity 0%，每个导出的 patch token 最近的 eager token 偏移三百多位，没有对应关系。
+
+原因方向很清楚：**TripoSplat 用 bf16 加载 dinov3，不是 fp16。** bf16 的指数范围和 fp32 一样，fp16 到 65504 就顶了。K0b 量过 fp16 eager 和 bf16 eager 的 cosine 是 0.99994——所以 fp16 本身能承载这个模型，但**只是因为 torch 的 attention 在内部用 fp32 累加**，从不让激活值在 fp16 里停留到溢出。导出的图没有这个待遇：ORT 把 attention 拆成 fp16 matmul、fp16 softmax、fp16 matmul，32 层逐层累积。
+
+这条对阶段 1 是硬约束：**浏览器端不能简单地"全 fp16"**。要么某些算子留在 fp32 算，要么整个编码器换掉。K0e 正在定位是哪一层表面（attention / MLP / LayerNorm）出的问题——只要知道是哪一处，WebGPU 里用 fp32 算那一段是合法的，代价可控。
+
 ### fp16 ONNX 总量（全五个模块）
 
 1682 + 742 + 476 + 102 + 69 = **3071 MB**。这是没有量化的起点，距离 900 MB 的 INT4 目标还差一个 4-bit 量化加一个 2–4 步蒸馏。
