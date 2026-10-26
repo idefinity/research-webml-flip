@@ -989,11 +989,29 @@ v* = (x_{k+n} − x_k) / Σ dt_i          n = 20 / 4 = 5
 - **camera 通道一起推进。** `[1,1,5]` 只有 5 个数，但采样器确实在积分它。冻在第 0 步的值，等于喂给学生一个教师从没到过的状态。
 - **fp32 主权重。** 管道给的是 fp16，而 fp16 只有约三位十进制：lr 5e-5 的更新量约 1e-5，权重约 1e-2，直接舍没。autocast 照样把矩阵乘跑在 fp16 上，所以这只花显存不花吞吐。T4 没有 bf16 核心，配 GradScaler。
 
+### K2h：数据集挂不上去，于是输入走 HTTP（`scripts/k2f_pipeline.py`）
+
+第二次追踪回来只有 4 张图，日志里写着 `FLIP_IMAGE_DIR /kaggle/input: 0 images`。查下来是：**通过 API 传 `datasetDataSources` 会被静默忽略**——`/kaggle/input` 存在，但是空的。等于那趟 COCO 白挂了，跑的还是上游仓库那四张示例图。
+
+于是先花一分钟跑了个探针，把"内核里到底能访问什么"一次问清楚：
+
+| 试的 | 结果 |
+|---|---|
+| `/kaggle/input`（挂 COCO） | 目录存在，**空的** |
+| `picsum.photos/seed/7/512` | **OK**，24 KB JPEG，0.4 s |
+| `images.cocodataset.org` | FAIL，证书主机名不匹配 |
+| HF API + `frgfm/imagenette` | API 通，但仓库里只有 `imagenette.py`——脚本式数据集，还得去 S3 拉 tgz，不保险 |
+
+结论：输入改成脚本自己抓（`FLIP_FETCH_N` / `FLIP_FETCH_TPL`，默认 picsum）。按 seed 缓存、原子写盘，因为两张卡的 worker 会并发抓同一批。
+
+**另一个更麻烦的限制：一个 kernel 的 output 不是下一个 kernel 的 input。** 轨迹每图 39 MB（`feature1` 4101×1280，40 次调用），48 张就是 2 GB，要经历"下载 → 传成 dataset → 挂载"，而挂载这条路刚刚证明是坏的。所以 `k2f_pipeline.py` 把追踪和训练放进**同一个 session**，顺序跑两个子进程。用子进程而不是 import，是因为 k2d 每张卡 fork 一个 worker，每个 worker 会重新执行自己的脚本文件——放在一个进程里的话，每个 worker 都会开始训练。
+
 ### 预算
 
 | 项 | 值 |
 |---|---|
-| Kaggle GPU | 30 h/周（T4），够跑 6–8 次完整蒸馏 |
+| Kaggle GPU | 30 h/周（T4），已用约 0.1 h |
+| 蒸馏一趟 | 追踪 48 图 ÷ 2 卡 ≈ 32 min，训练 192 对 × 8 epoch ≈ 2.6 h |
 | 单次 session | 12 h 上限 |
 | HF 存储 | 几个 GB，免费额度内 |
 | GitHub Pages | 站点 < 100 MB，权重不进站 |

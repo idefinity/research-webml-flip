@@ -68,6 +68,15 @@ LR = float(os.environ.get("FLIP_LR", "5e-5"))
 ACCUM = int(os.environ.get("FLIP_ACCUM", "1"))
 SAVE_EVERY = int(os.environ.get("FLIP_SAVE_EVERY", "4"))
 DRY = os.environ.get("FLIP_DRY", "0") == "1"
+CKPT = os.environ.get("FLIP_CKPT", "1") == "1"
+
+# The factor that turns a difference of recorded t values into the dt the
+# sampler multiplies the velocity by. Measured before any pair is built unless
+# FLIP_T_SCALE says otherwise - guessing it costs a factor of a thousand.
+DT_SCALE = 1.0
+FIT_T = not os.environ.get("FLIP_T_SCALE", "").strip()
+if not FIT_T:
+    DT_SCALE = float(os.environ["FLIP_T_SCALE"])
 
 R = {"notes": [], "training": [], "eval": []}
 
@@ -161,6 +170,96 @@ def split_call(call):
     return state, t, cond
 
 
+def fit_dt_scale(tr, verbose=True):
+    """Measure the dt the sampler actually multiplies the velocity by.
+
+    This is the one number I do not want to guess. The trace records t in the
+    0..1000 range, and the sampler's step could be the difference of those
+    values or the difference of the underlying 0..1 schedule - a factor of a
+    thousand either way. Get it wrong and the student is trained to output a
+    velocity a thousand times too small, which is not a correction it should
+    have to learn.
+
+    So measure it. Every recorded state has two model outputs on it (CFG runs
+    the module twice per step), and the next state is known, so
+
+        dx_i = v_eff_i * dt_i          dt_i = <dx_i, v_eff_i> / <v_eff_i, v_eff_i>
+
+    and the only unknown is which of the two calls is the conditional branch.
+    Try every plausible combination and keep the one whose implied dt is most
+    consistently proportional to the recorded one - the wrong branch assignment
+    gives a scatter, the right one gives a straight line.
+    """
+    states, ts, final = trajectory(tr)
+    outs = [as_map(c["out"]) for c in tr["calls"]]
+    if len(outs) != 2 * len(states):
+        return None
+    n = len(states)
+    dts = [(ts[i + 1] - ts[i]) if i < n - 1 else (0.0 - ts[i]) for i in range(n)]
+
+    combos = [
+        ("cfg 3a-2b", lambda a, b: 3.0 * a - 2.0 * b),
+        ("cfg 3b-2a", lambda a, b: 3.0 * b - 2.0 * a),
+        ("first only", lambda a, b: a),
+        ("second only", lambda a, b: b),
+        ("mean", lambda a, b: 0.5 * (a + b)),
+    ]
+    best = None
+    for name, f in combos:
+        ratios = []
+        for i in range(n):
+            v = f(outs[2 * i]["latent"], outs[2 * i + 1]["latent"])
+            v = v.float().flatten()
+            denom = float(v.dot(v))
+            if denom < 1e-12 or abs(dts[i]) < 1e-12:
+                continue
+            x1 = final["latent"] if i == n - 1 else states[i + 1]["latent"]
+            dx = (x1.float().flatten() - states[i]["latent"].float().flatten())
+            ratios.append(float(dx.dot(v)) / denom / dts[i])
+        if len(ratios) < n // 2:
+            continue
+        med = sorted(ratios)[len(ratios) // 2]
+        spread = (max(ratios) - min(ratios)) / max(abs(med), 1e-12)
+        if verbose:
+            note(f"  dt fit {name:12s} median {med:.6g}  "
+                 f"spread {spread:.3f}  n={len(ratios)}")
+        if best is None or spread < best[2]:
+            best = (name, med, spread)
+    return best
+
+
+def enable_ckpt(model, min_blocks=4):
+    """Checkpoint the repeated blocks so activations are not all resident.
+
+    One checkpoint around the whole model saves nothing - the recompute builds
+    the same graph. The saving comes from many small segments, each freed
+    before the next recomputes. Found generically rather than by name: the
+    longest homogeneous ModuleList in the model.
+    """
+    import torch.nn as tn
+    import torch.utils.checkpoint as cp
+
+    target = None
+    for name, mod in model.named_modules():
+        kids = list(mod) if isinstance(mod, (tn.ModuleList, tn.Sequential)) else None
+        if not kids or len(kids) < min_blocks:
+            continue
+        if len({type(k).__name__ for k in kids}) != 1:
+            continue
+        if target is None or len(kids) > len(target[1]):
+            target = (name, kids)
+    if target is None:
+        return None
+    for blk in target[1]:
+        orig = blk.forward
+
+        def wrapped(*a, _o=orig, **kw):
+            return cp.checkpoint(_o, *a, use_reentrant=False, **kw)
+
+        blk.forward = wrapped
+    return target[0]
+
+
 def trajectory(trace):
     """Collapse the call list into the sequence of distinct states.
 
@@ -193,13 +292,16 @@ def build_pairs(traces):
             continue
         cond = split_call(tr["calls"][0])[2]
         n = len(states)
-        # dt between consecutive recorded states. One update per call, so there
-        # are n intervals for n recorded states - the last one lands on `final`
-        # and has no recorded t of its own. Reuse the previous interval for it
-        # rather than inventing a terminal t.
+        # dt between consecutive recorded states. The last interval is not
+        # recorded: the sampler steps from ts[-1] to the endpoint. The recorded
+        # t values fit sigma = 3u/(1+2u)*1000 for u uniform on [0.05, 1] to
+        # four decimal places, so the endpoint is 0 and the interval is
+        # -ts[-1]. Reusing the previous interval instead, as this did, counts
+        # it twice and makes the final student step a third too long.
         dts = [ts[i + 1] - ts[i] for i in range(n - 1)]
         if dts:
-            dts.append(dts[-1])
+            dts.append(0.0 - ts[-1])
+        dts = [d * DT_SCALE for d in dts]
         all_states = states + [final]
         n_int = len(dts)
         if n_int < S_STEPS:
@@ -343,6 +445,27 @@ def main():
          f"(|camera| {float(states[0]['camera'].float().norm()):.4f}) "
          f"- if this is not zero both channels have to be integrated")
 
+    global DT_SCALE
+    if FIT_T:
+        note("fitting the sampler's dt against the recorded states")
+        fit = fit_dt_scale(first) or fit_dt_scale(traces[-1])
+        if fit is None:
+            note("  could not fit - assuming recorded t differences are the dt")
+            DT_SCALE = 1.0
+        else:
+            name, med, spread = fit
+            DT_SCALE = med
+            note(f"  {name}: dt = {med:.6g} x the recorded t difference "
+                 f"(spread {spread:.3f})")
+            if spread > 0.2:
+                note(f"  WARNING spread {spread:.2f} - the branch assignment may "
+                     f"be wrong; set FLIP_T_SCALE to override")
+    else:
+        note(f"dt scale from FLIP_T_SCALE: {DT_SCALE}")
+    note(f"dt scale {DT_SCALE:.6g}  "
+         f"(1 = the velocity is per unit of recorded t, "
+         f"~1e-3 = per unit of the underlying 0..1 schedule)")
+
     pairs, grid = build_pairs(traces)
     note(f"{len(pairs)} training pairs from {len(traces)} images")
     if pairs:
@@ -390,6 +513,19 @@ def main():
     student.train()
     n_par = sum(p.numel() for p in student.parameters())
     note(f"student params {n_par / 1e6:.1f} M  fp32 Adam state ~{n_par * 12 / 1e9:.1f} GB")
+    if CKPT:
+        # The smoke run skipped every single sample on OOM: inference fits
+        # easily because nothing is retained, but a backward through 24 layers
+        # over 8192 latent tokens plus 4101 conditioning tokens does not.
+        where = enable_ckpt(student)
+        note(f"gradient checkpointing on {where}")
+        if where is None:
+            note("  no repeated block list found - dumping the structure so the "
+                 "next run can target it by name")
+            for name, mod in student.named_children():
+                kids = [type(k).__name__ for k in mod.children()]
+                note(f"    {name}: {type(mod).__name__} "
+                     f"{kids[:6]}{' ...' if len(kids) > 6 else ''}")
 
     # fp32 master weights matter more than they look. The pipeline hands over
     # fp16 params, and fp16 carries about three decimal digits: at lr 5e-5 an
@@ -424,10 +560,16 @@ def main():
                     loss = sum(torch.nn.functional.mse_loss(
                         v[k].float(), tgt[k]) for k in tgt if k in v) / ACCUM
                 scaler.scale(loss).backward()
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as exc:
                 # A three-hour run should not end because one sample was the
                 # first to tip the allocator over. Drop the sample's gradients
-                # and carry on; the count is reported so it is visible.
+                # and carry on - but say why, because "skipped 24 of 24" with
+                # no reason is exactly how a swallowed bug looks.
+                if skipped == 0:
+                    note(f"  OOM on sample {bi}: {exc}")
+                    if DEV.type == "cuda":
+                        note(f"    peak {torch.cuda.max_memory_allocated() / 1e9:.2f} GB, "
+                             f"{torch.cuda.mem_get_info()[0] / 1e9:.2f} GB free now")
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 if DEV.type == "cuda":
