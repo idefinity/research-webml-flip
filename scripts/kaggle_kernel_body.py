@@ -102,15 +102,34 @@ log(run(["du", "-sh", str(ckpt)]).stdout.strip())
 # ---------------------------------------------------------------------------
 # 4. fetch the real script at the pinned SHA and run it
 # ---------------------------------------------------------------------------
-url = (f"https://raw.githubusercontent.com/{FLIP_REPO}/{FLIP_SHA}/{FLIP_SCRIPT}")
-log(f"fetching {url}")
-try:
-    with urllib.request.urlopen(url, timeout=60) as fh:
-        src = fh.read().decode("utf-8")
-except Exception:  # noqa: BLE001
-    log("FETCH FAILED - is the commit pushed and is the repo still public?")
-    log(traceback.format_exc()[-1200:])
-    raise
+def fetch(url):
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github.raw",
+        "User-Agent": "flip-kernel",
+    })
+    with urllib.request.urlopen(req, timeout=60) as fh:
+        return fh.read().decode("utf-8")
+
+
+# raw.githubusercontent.com is blocked on some networks; api.github.com serves
+# the same bytes from a different host, so try both before giving up.
+candidates = [
+    f"https://raw.githubusercontent.com/{FLIP_REPO}/{FLIP_SHA}/{FLIP_SCRIPT}",
+    f"https://api.github.com/repos/{FLIP_REPO}/contents/{FLIP_SCRIPT}?ref={FLIP_SHA}",
+]
+
+src = None
+for url in candidates:
+    log(f"fetching {url}")
+    try:
+        src = fetch(url)
+        log(f"  ok, {len(src)} bytes")
+        break
+    except Exception:  # noqa: BLE001
+        log(f"  FAILED ({type(sys.exc_info()[1]).__name__})")
+if src is None:
+    log("FETCH FAILED on every candidate - is the commit pushed, the repo public?")
+    raise RuntimeError("could not fetch probe script")
 
 digest = hashlib.sha256(src.encode()).hexdigest()[:16]
 log(f"fetched {len(src)} bytes, sha256:{digest}")
