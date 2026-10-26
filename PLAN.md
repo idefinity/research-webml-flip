@@ -470,6 +470,22 @@ cast 这一步是 K0 逼出来的，不是可选项：dinov3 和 flux2 VAE 是�
 
 见下方「基础设施与资产管线」。一句话：站点走 GitHub Pages，权重走 HuggingFace。两边各自的硬上限直接决定了这个分工。
 
+### 1.5 高斯渲染器：不是风险，但得选一个
+
+我们只负责**生成**高斯，**渲染**交给现成库。这块已经有公开的横向数据，SpawnScene 的 `Docs/benchmarks.md` 测过四家同台：
+
+> "opened in SpawnScene, Spark, PlayCanvas and GaussianSplats3D from the same seven camera poses, a 742K-splat scene draws the same picture in all four, and all four hold 60 fps at 1600x900 on an RTX 4070."
+
+七万四千二百高斯，1600×900，四家全部 60 fps，而且画出来一样。
+
+我们的量级是 **65K，是那个的 1/11**。所以"浏览器能不能实时渲染"不是这个项目的风险点，把它从风险登记里划掉。
+
+选型倾向 **Spark**：独立库、体积小、不绑 three.js 的版本节奏。备选 GaussianSplats3D（生态最大，但跟 three.js 版本绑定，升级时容易炸）。
+
+**真正要自己写的只有一件事**：把 ONNX 吐出来的高斯属性搬到 GPU buffer。一次 65K × (3 位置 + 4 旋转 + 3 缩放 + 1 不透明度 + SH 系数)，几百 KB 到几 MB 的量级，一次 `writeBuffer` 就完。这一步没有算法，只有搬运。
+
+SPZ 之类的压缩格式值得看一眼——首访要下 900 MB 权重，导出/缓存的场景数据再省一个量级是有意义的。具体倍数要实测，不要抄别人的宣传数字。
+
 ---
 
 ## 阶段 2（2–3 周）：把手办感做成风格
