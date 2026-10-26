@@ -38,8 +38,12 @@ Env:
   FLIP_TRACE_DIR  where k2d wrote its traces (default /kaggle/working/k2d)
   FLIP_STEPS      student calls (default 4)
   FLIP_EPOCHS     passes over the pair set (default 40)
-  FLIP_LR         AdamW lr (default 5e-5)
-  FLIP_ACCUM      samples per optimiser step (default 4)
+  FLIP_LR         AdamW lr (default 2e-5)
+  FLIP_ACCUM      samples per optimiser step (default 1)
+  FLIP_W_CAM      weight on the camera channel's MSE (default 0.05)
+  FLIP_GRID       "sigma" (default) or "index" - how the steps are spaced
+  FLIP_T_SCALE    dt per unit of recorded t (default: measured from the trace)
+  FLIP_CKPT       0 to disable gradient checkpointing
   FLIP_DRY        1 = print the pair table and exit, no training
 """
 
@@ -64,16 +68,22 @@ OUT.mkdir(parents=True, exist_ok=True)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 S_STEPS = int(os.environ.get("FLIP_STEPS", "4"))
 EPOCHS = int(os.environ.get("FLIP_EPOCHS", "40"))
-LR = float(os.environ.get("FLIP_LR", "5e-5"))
+LR = float(os.environ.get("FLIP_LR", "2e-5"))
 ACCUM = int(os.environ.get("FLIP_ACCUM", "1"))
 SAVE_EVERY = int(os.environ.get("FLIP_SAVE_EVERY", "4"))
 DRY = os.environ.get("FLIP_DRY", "0") == "1"
-# Weight on the camera channel's MSE. See the training loop: latent has 131072
-# elements and camera has 5, so unweighted the camera is invisible to the loss.
-W_CAM = float(os.environ.get("FLIP_W_CAM", "1"))
+# Weight on the camera channel's MSE. Measured, not guessed: unweighted, the
+# camera is 5 elements against the latent's 131072 and vanishes - but at 1.0 it
+# is worse than vanishing, because its per-segment error is ~2.6 against the
+# latent's ~0.48, so it took 97% of epoch 0's gradient and the eval went
+# backwards while the loss fell 8x. The camera needs almost no training: it
+# starts at 0.996 cosine. This puts the two terms on the same scale.
+W_CAM = float(os.environ.get("FLIP_W_CAM", "0.05"))
 # "sigma" (default) spaces the student's steps evenly in the schedule;
 # "index" spaces them evenly in teacher step count.
 GRID_MODE = os.environ.get("FLIP_GRID", "sigma").strip().lower()
+# Images never trained on, so the eval measures generalisation, not fit.
+HOLDOUT = int(os.environ.get("FLIP_HOLDOUT", "2"))
 # Not CKPT - that name is already the weights directory above, and this flag
 # shadowed it, which is how a run died on 'bool' object has no attribute
 # 'rglob' after five minutes of tracing.
@@ -609,6 +619,15 @@ def main():
          f"~1e-3 = per unit of the underlying 0..1 schedule)")
 
     pairs, grid = build_pairs(traces)
+    if HOLDOUT:
+        # Evaluating on images the student trained on only measures fit. With
+        # this few objects, "fit" and "memorised" are hard to tell apart, and
+        # the whole point is whether it generalises to the photo someone drops
+        # in. So the first few images are never trained on.
+        held = {tr["image"] for tr in traces[:HOLDOUT]}
+        before_n = len(pairs)
+        pairs = [p for p in pairs if p["image"] not in held]
+        note(f"held out {sorted(held)} - {len(pairs)} of {before_n} pairs left")
     note(f"{len(pairs)} training pairs from {len(traces)} images")
     if pairs:
         mags = [float(p["target"]["latent"].abs().mean()) for p in pairs]
@@ -687,8 +706,11 @@ def main():
     # fp16 params, and fp16 carries about three decimal digits: at lr 5e-5 an
     # update is ~1e-5 against weights of ~1e-2, which rounds to nothing.
     # Autocast runs the matmuls in fp16 either way, so this costs memory only.
+    # weight_decay 0: the student starts from the teacher and is meant to stay
+    # near it. Pulling 370 M weights toward zero while asking them to reproduce
+    # the teacher is two objectives, and only one of them is the task.
     opt = torch.optim.AdamW(student.parameters(), lr=LR, betas=(0.9, 0.95),
-                            weight_decay=0.01)
+                            weight_decay=0.0)
     # T4 is sm75: no bf16 cores, so fp16 with a scaler. LayerNorm stays fp32
     # under autocast, which is the same reason dinov3 needed the fp32-stats fix.
     scaler = torch.amp.GradScaler(device="cuda", enabled=(DEV.type == "cuda"))
@@ -698,6 +720,7 @@ def main():
                     "s_steps": S_STEPS}, OUT / tag)
         note(f"  saved {tag} {(OUT / tag).stat().st_size / 1e9:.2f} GB")
 
+    best = float("inf")
     t0 = time.time()
     for epoch in range(EPOCHS):
         order = torch.randperm(len(pairs)).tolist()
@@ -761,6 +784,22 @@ def main():
         save()
         if SAVE_EVERY and (epoch + 1) % SAVE_EVERY == 0:
             dump(f"student_e{epoch + 1:03d}.pt")
+        # Evaluate every epoch and keep the best. The loss falling is not the
+        # same as the reconstruction improving - it did not, last time - and a
+        # three-hour run that ends on a worse model than it started with has
+        # nothing to show for itself. Two images is ~16 s.
+        student.eval()
+        with torch.no_grad():
+            rows = evaluate(student, traces[:2], grid_json, f"e{epoch + 1}")
+        student.train()
+        scores = [r["channels"]["latent"]["rel_l2"] for r in rows
+                  if "latent" in r.get("channels", {})]
+        if scores:
+            score = sum(scores) / len(scores)
+            if score < best:
+                best = score
+                dump("student_best.pt")
+                note(f"  best so far: rel-l2 {score:.3f}")
         if skipped > len(pairs) // 2:
             # Do not spend three hours proving the same thing 1536 times.
             note(f"STOPPING: {skipped} of {len(pairs)} samples did not fit. "
