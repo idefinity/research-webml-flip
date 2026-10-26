@@ -276,21 +276,57 @@ TypeError: Module._wrapped_call_impl() got multiple values for argument 'mod'
 
 这条对阶段 1 是硬约束：**浏览器端不能简单地"全 fp16"**。要么某些算子留在 fp32 算，要么整个编码器换掉。K0e 正在定位是哪一层表面（attention / MLP / LayerNorm）出的问题——只要知道是哪一处，WebGPU 里用 fp32 算那一段是合法的，代价可控。
 
-### fp16 ONNX 总量（全五个模块）
+### K0e：一个真数字，和一组作废的实验
 
-1682 + 742 + 476 + 102 + 69 = **3071 MB**。这是没有量化的起点，距离 900 MB 的 INT4 目标还差一个 4-bit 量化加一个 2–4 步蒸馏。
+先说真的那个。fp32 残差流的峰值是 **33,603**（第一层 80，最后一层 28,877）。fp16 那边峰值 33,632，最高的是第 30 层。
+
+**33,603 没有溢出。** fp16 的上限 65,504，这只用了 51%。所以"某个激活值直接顶到 inf"这个说法，**在残差流这一级上不成立**——K0e 本来想验证的假设，被它自己的数据否掉了。
+
+然后 ablation 全线作废，而且是我自己坑的：
+
+- `baseline` 和 `attn_fp32` 的 cos 是 0.074611 和 0.0746，`patch_mean` 是 0.067093 和 0.067082——几乎逐位相同。把 attention 换成 fp32，导出的图一个比特都没动。
+- 说明 **dynamo 导出器不记录 monkeypatch**。它在 bytecode 层把 `F.scaled_dot_product_attention` 解析成 aten 算子，我那个 Python 包装函数从来没进过图。这个实验从设计上就是无效的。
+- 另外两组撞了 dtype 错（`mat1 and mat2 must have the same dtype, but got Float and Half`）——我把输入 cast 到 fp32，权重没 cast。
+- 更糟的是用例表里**压根没有"只开 norm"**这一组。MLP 一挂，norm 就永远测不到。这是设计缺陷，不是运气差。
+
+所以 K0e 只有一条结论能用：**残差流不溢出**。
+
+### 从这条否证里长出来的假设：是逐 token 的，不是逐张量的
+
+`nn.LayerNorm` 在最后一维（1280）上归一化，所以它**逐 token**。它要算方差，而方差是平方的均值。
+
+残差里某几个 token 量级到 1e4，平方就是 1e8。fp16 上限 65,504——**|x| 只要超过 256，x² 当场溢出**。
+
+于是：小 token 的方差没事，大 token 的方差变 inf，`rsqrt(inf)` 给 0，那个 token 的 1280 个通道一起被压成常数。**逐张量溢出会把所有 token 一起带走，逐 token 溢出只带走量级大的那些。**
+
+这一下把 K0c 里唯一不对劲的细节解释干净了：
+
+| token | cosine |
+|---|---|
+| 0（cls）、1、3、4（register） | 0.99999 / 1.0 / 0.99999 / 0.99999 |
+| 2（register） | −0.040 |
+| 5…4100（4096 个 patch） | 0.067，全部 < 0.9 |
+
+在这个模型里，"量级大的那些"正好是全部 patch token，加一个倒霉的 register。
+
+torch 自己的 fp16 LayerNorm 把归约提升到 fp32（`acc_type`），所以 fp16 eager 是 1.0003；导出的 fp16 图没有这个提升，它拿到的是 fp16 的 Mean / Mul / Sqrt。
+
+**K0f 正在验证这条**，方式和 K0e 相反——完全绕开 ONNX，在纯 PyTorch 里把三种 LayerNorm 实现（torch 自带 / 朴素 fp16 / fp32 统计）分别接到同一个 fp16 模型上。如果"朴素 fp16"落到 0.067、"fp32 统计"回到 1.0，就同时证明了病灶和修法，一次 session 搞定。
+
+这个修法在 WebGPU 里是合法的：统计用 fp32 算，存储照样 fp16。逐 token 归约本来就小，代价可以忽略。
 
 ### ONNX 总量（fp16，未量化）
 
 | 模块 | 文件 |
 |---|---|
 | dinov3 | 1682 MB |
+| DiT（flow） | 742 MB |
 | gs_decoder | 476 MB |
 | octree_level | 102 MB |
 | vae_encoder | 69 MB |
-| **小计（不含 DiT）** | **2328 MB** |
+| **合计** | **3071 MB** |
 
-加上 DiT 的 741 MB 就是约 3.07 GB fp16。INT4 是 904 MB——中间差着一个 4-bit 量化、一个 2–4 步蒸馏、和一整套分片下载设计。
+1682 + 742 + 476 + 102 + 69 = **3071 MB**，约 3.07 GB。这是没有量化的起点。INT4 是 904 MB——中间差着一个 4-bit 量化、一个 2–4 步蒸馏、和一整套分片下载设计。
 
 一个容易踩的坑：dynamo 路径导出的 `.onnx` 只有 0.3 MB，权重在旁边的 `.onnx.data` 里。按 `.onnx` 文件大小判断模型体积会被骗到脚底下。
 
