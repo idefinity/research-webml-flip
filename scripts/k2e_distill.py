@@ -238,35 +238,84 @@ def fit_dt_scale(tr, verbose=True):
 
 
 def enable_ckpt(model, min_blocks=4):
-    """Checkpoint the repeated blocks so activations are not all resident.
+    """Checkpoint every repeated stack of blocks so activations are not all
+    resident at once.
 
-    One checkpoint around the whole model saves nothing - the recompute builds
-    the same graph. The saving comes from many small segments, each freed
-    before the next recomputes. Found generically rather than by name: the
-    longest homogeneous ModuleList in the model.
+    One checkpoint around the whole model saves nothing - the recompute
+    rebuilds the same graph. The saving comes from many small segments, each
+    freed before the next one recomputes.
+
+    Every homogeneous stack of >= min_blocks is wrapped, not just the longest.
+    Picking the longest was a guess about which stack is the transformer, and
+    a 14 GB allocation says the guess did not pay off: the blocks that
+    actually hold the activations may not have been the ones wrapped. Wrapping
+    all of them costs a recompute on stacks that did not need it, which is
+    minutes, against a run that does not train at all, which is hours.
     """
     import torch.nn as tn
     import torch.utils.checkpoint as cp
 
-    target = None
+    found = []
     for name, mod in model.named_modules():
         kids = list(mod) if isinstance(mod, (tn.ModuleList, tn.Sequential)) else None
         if not kids or len(kids) < min_blocks:
             continue
         if len({type(k).__name__ for k in kids}) != 1:
             continue
-        if target is None or len(kids) > len(target[1]):
-            target = (name, kids)
-    if target is None:
-        return None
-    for blk in target[1]:
-        orig = blk.forward
+        for blk in kids:
+            orig = blk.forward
 
-        def wrapped(*a, _o=orig, **kw):
-            return cp.checkpoint(_o, *a, use_reentrant=False, **kw)
+            def wrapped(*a, _o=orig, **kw):
+                return cp.checkpoint(_o, *a, use_reentrant=False, **kw)
 
-        blk.forward = wrapped
-    return target[0]
+            blk.forward = wrapped
+        n_par = sum(p.numel() for p in mod.parameters())
+        found.append(f"{name}: {len(kids)} x {type(kids[0]).__name__} "
+                     f"({n_par / 1e6:.0f} M)")
+    return found or None
+
+
+def probe_sdpa(head_dim, n_lat=8192, n_cond=4101):
+    """Which attention backend actually works here, and does it materialise
+    the N^2 matrix.
+
+    On sm75 flash is out, so the choice is mem-efficient against math. If it
+    falls back to math, one layer's backward holds 12293^2 * 2 bytes * heads,
+    which is several GB - the difference between fitting and not. Rather than
+    assume, run the real shapes and see.
+    """
+    import torch.nn.attention as attn
+
+    try:
+        backends = list(attn.SDPBackend.__members__.values())
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    report, usable = [], []
+    for hd in (head_dim, 64, 128):
+        q = torch.randn(1, 16, n_lat + n_cond, hd, device=DEV, dtype=torch.float16)
+        row = []
+        for b in backends:
+            try:
+                with attn.sdpa_kernel([b]):
+                    torch.nn.functional.scaled_dot_product_attention(q, q, q)
+                row.append(f"{b.name} ok")
+                if hd == head_dim:
+                    usable.append(b)
+            except Exception as exc:  # noqa: BLE001
+                row.append(f"{b.name} no ({type(exc).__name__})")
+        report.append(f"head {hd}: " + ", ".join(row))
+    note("sdpa: " + " | ".join(report))
+    # Prefer anything that is not the math backend. If only math works, say so
+    # loudly - the run will be fighting for memory the whole way.
+    for b in usable:
+        if "FLASH" in b.name:
+            return b.name
+    for b in usable:
+        if "EFFICIENT" in b.name or "CUDNN" in b.name:
+            return b.name
+    note("MATH ONLY: every attention layer materialises its N^2 matrix, and "
+         "backward holds it. Expect to fight for memory the whole run.")
+    return "MATH_ONLY"
 
 
 def trajectory(trace):
@@ -373,6 +422,18 @@ def build_pairs(traces):
 
 # ---------------------------------------------------------------------------
 # the model
+def autocast():
+    """fp16 matmuls, fp32 reductions - and no weight cache.
+
+    cache_enabled=False because the student's weights are fp32 master copies:
+    autocast would otherwise keep an fp16 copy of all 370 M of them alive for
+    the whole run, 741 MB, to save re-casting them per use. That cast is
+    milliseconds against 6 seconds a sample.
+    """
+    return torch.autocast("cuda", dtype=torch.float16,
+                          enabled=(DEV.type == "cuda"), cache_enabled=False)
+
+
 # ---------------------------------------------------------------------------
 
 def build_pipeline():
@@ -457,9 +518,9 @@ def evaluate(student, traces, grid_json, tag):
                 for k, v in split_call(tr["calls"][0])[2].items()}
         x0 = states[0]
         try:
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16,
-                                                 enabled=(DEV.type == "cuda")):
-                xs = integrate(student, x0, grid_json["t"], grid_json["dt"], cond)
+            with torch.no_grad(), autocast():
+                xs = integrate(student, x0, grid_json["t"],
+                               grid_json["dt"], cond)
             out = {}
             for ch in ("latent", "camera"):
                 if ch not in xs or ch not in final:
@@ -594,8 +655,18 @@ def main():
     student.train()
     n_par = sum(p.numel() for p in student.parameters())
     note(f"student params {n_par / 1e6:.1f} M  fp32 Adam state ~{n_par * 12 / 1e9:.1f} GB")
+    if DEV.type == "cuda":
+        note(f"sdpa backend in use: {probe_sdpa(80)}")
     with torch.no_grad():
         evaluate(student, traces, grid_json, "before")
+    # The teacher is 741 MB of fp16 sitting on the same card for no reason
+    # now that the student is a deepcopy of it.
+    teacher.to("cpu")
+    del teacher
+    gc.collect()
+    if DEV.type == "cuda":
+        torch.cuda.empty_cache()
+        note(f"dropped the teacher: {torch.cuda.memory_allocated() / 1e9:.2f} GB live")
     if GRAD_CKPT:
         # The smoke run skipped every single sample on OOM: inference fits
         # easily because nothing is retained, but a backward through 24 layers
@@ -603,6 +674,8 @@ def main():
         where = enable_ckpt(student)
         note(f"gradient checkpointing on {where}")
         if where is None:
+            note("  NO repeated block list found - nothing is checkpointed and "
+                 "the activations will all be resident")
             note("  no repeated block list found - dumping the structure so the "
                  "next run can target it by name")
             for name, mod in student.named_children():
@@ -637,8 +710,7 @@ def main():
                 tgt = {k: v.to(DEV) for k, v in p["target"].items()}
                 cond = {k: (v.to(DEV).float() if torch.is_tensor(v) else v)
                         for k, v in p["cond"].items()}
-                with torch.autocast("cuda", dtype=torch.float16,
-                                    enabled=(DEV.type == "cuda")):
+                with autocast():
                     v = forward_velocity(student, state, p["t"], cond)
                     terms = {k: torch.nn.functional.mse_loss(v[k].float(), tgt[k])
                              for k in tgt if k in v}
@@ -668,6 +740,11 @@ def main():
             run_n += 1
             for k, val in terms.items():
                 run_terms[k] = run_terms.get(k, 0.0) + float(val)
+            if run_n == 1 and DEV.type == "cuda":
+                # How much room is left. The next sample is the same size, so
+                # this is the number that decides whether the run survives.
+                note(f"  first sample peak {torch.cuda.max_memory_allocated() / 1e9:.2f} GB "
+                     f"of {torch.cuda.mem_get_info()[1] / 1e9:.2f} GB")
             if (bi + 1) % ACCUM == 0:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
@@ -684,6 +761,11 @@ def main():
         save()
         if SAVE_EVERY and (epoch + 1) % SAVE_EVERY == 0:
             dump(f"student_e{epoch + 1:03d}.pt")
+        if skipped > len(pairs) // 2:
+            # Do not spend three hours proving the same thing 1536 times.
+            note(f"STOPPING: {skipped} of {len(pairs)} samples did not fit. "
+                 f"Nothing was learned; fix the memory budget first.")
+            break
 
     student.eval()
     evaluate(student, traces, grid_json, "final")
