@@ -44,22 +44,43 @@ Metal 有 `shader-f16`，所以走 q4f16；没有这个特性的适配器（部�
 **卷积不量化。** `ConvInteger` / `QLinearConv` 在 WebGPU EP 上没有实现，量化了会掉回 CPU，
 比不量化慢一个数量级。VAE 和抠图的卷积留 fp16。
 
-**三处 ONNX 会撞墙，先量再决定：**
+**这三个问号已经量过了**（`webgpu/onnx-probe.html`，ORT-web 1.31.1，apple metal-3，
+shader-f16 有）：
 
-1. **DiT 的注意力**（12294 token）。如果 ORT 把它拆成 MatMul + Softmax，score 矩阵是
-   12294² × 2 B = 302 MB/头，384 次（24 块 × 16 头 × 2 步）。物化不会 OOM，但会把
-   我们 359 ms/块的融合核拖到可能 800 ms/块。三个选择：
-   - a) 看 `com.microsoft::Attention` 在 WebGPU EP 上有没有融合实现；
-   - b) 让 ORT 物化，实测能不能接受；
-   - c) **保留我们自己写的 WGSL attention**，和 ORT 通过 `gpu-buffer` 交接。
-   预算够就不切，不够就 c。这一步的实测结果决定整个架构。
-2. **octree 的 8 层循环**。每一层的点数由采样结果决定，是数据相关的。图只提供单层前向，
-   循环写在 JS 里，8 次 session.run。
-3. **3DGS 光栅化**。本来就不是神经网络，用现成的 `site/src/viewer.js`。
+| 图 | ORT WebGPU | 我们手写的 WGSL | 差 |
+|---|---|---|---|
+| int4 1024→3072 @12294 | 98.0 ms · **789 GFLOP/s** | 1591–1796 | 2.3× |
+| int4 1024→4096 @12294 | 130.2 ms · 792 | 同上 | 2.3× |
+| attention 1 头 L=12294 | 95.3 ms · **406 GFLOP/s** | 1789 | 4.4× |
+| conv 3×3 128→128 @128² | 6.8 ms · **711 GFLOP/s** | 443 | 0.6×（ORT 更快） |
+| 同上，走 wasm EP | 83.2 ms · 58 | — | 12×，证明没有回退 |
 
-**留一条退路**：如果注意力必须走 c，那这个仓库就跑着两个运行时（ORT + 我们的 WGSL）。
-交接靠 `preferredOutputLocation: 'gpu-buffer'`，ORT-web 支持把输出留在显存上也支持直接吃显存输入。
-代价是胶水代码，收益是 fusion 省下的十几秒。
+结论三条：
+
+1. **`MatMulNBits` 真的跑在 WebGPU EP 上。** 不是 wasm 回退：同一个卷积图在 wasm 上是
+   58 GFLOP/s，在 WebGPU 上是 711。
+2. **注意力必须自己来。** ORT 把它拆成 2 个 MatMul + Softmax（17 个节点），score 矩阵真的物化了，
+   406 GFLOP/s。按这个速率，DiT 的注意力是 16 头 × 95.3 ms × 24 块 × 2 步 = **73 秒**，
+   而我们融合核是 16.6 秒。**纯 ONNX 的 DiT 一次前向约 94 秒，我们自己的核是 26 秒。**
+   所以走 c：ORT 管除注意力以外的部分，注意力用我们的 WGSL，靠 `gpu-buffer` 交接。
+3. **卷积交给 ORT。** 711 比我们手写的直接卷积快 60%，VAE 的 6.75 TFLOP 落在 9.5 秒
+   （原来按手写核估的是 6.6–15.2 秒）。这一头不用自己写。
+
+**所以架构是混合的，而且理由不是偏好、是量出来的**：
+
+| 段 | 跑在哪 |
+|---|---|
+| VAE / 抠图（卷积为主） | ONNX + WebGPU EP（711 GFLOP/s，比我们快） |
+| DINO 学生 / DiT 的矩阵乘 | ONNX int4（789，可用但不是最快） |
+| DiT 的注意力 | 我们的 WGSL（4.4×） |
+| octree 8 层循环 + 解码 | ONNX 单层图 + JS 循环 |
+| Gaussian 光栅化 | `site/src/viewer.js` |
+
+代价：仓库里跑着两个运行时。交接靠 `preferredOutputLocation: 'gpu-buffer'`，
+ORT-web 既支持把输出留在显存，也支持直接吃显存输入。
+
+**还没量的**：fp16 激活（q4f16）那一档，和 `com.microsoft::Attention` 在 WebGPU 上有没有
+融合核（P0 v8 正在跑）。如果融合核存在，第 2 条可以推翻。
 
 ---
 

@@ -31,7 +31,10 @@ import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/o
 
 const $t = document.getElementById('t');
 const logEl = document.getElementById('log');
+const rows = [];
 const row = (k, v, cls) => {
+  rows.push([k, v]);
+  window.__rows = rows;
   const tr = document.createElement('tr');
   tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
   $t.appendChild(tr);
@@ -42,10 +45,20 @@ ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/di
 try { ort.env.webgpu.powerPreference = 'high-performance'; } catch (e) {}
 
 const CASES = [
-  { name: 'mm_qkv',   file: 'onnx/mm_qkv_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 3072, note: 'int4 1024×3072' },
-  { name: 'mm_mlp',   file: 'onnx/mm_mlp_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 4096, note: 'int4 1024×4096' },
-  { name: 'attn1h',   file: 'onnx/attn_1head.onnx', shape: { q: [1, 1, 12294, 64], k: [1, 1, 12294, 64], v: [1, 1, 12294, 64] }, flops: 4 * 12294 * 12294 * 64, note: '一个头，L=12294' },
+  // wasm is only tried on the small one: 77 GFLOP of matmul through wasm is a
+  // minute of nothing, and its only job here is to answer "did webgpu silently
+  // fall back", which one graph is enough to answer.
+  { name: 'mm_qkv',   file: 'onnx/mm_qkv_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 3072, note: 'int4 1024×3072', eps: ['webgpu'] },
+  { name: 'mm_mlp',   file: 'onnx/mm_mlp_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 4096, note: 'int4 1024×4096', eps: ['webgpu'] },
+  { name: 'attn1h',   file: 'onnx/attn_1head.onnx', shape: { q: [1, 1, 12294, 64], k: [1, 1, 12294, 64], v: [1, 1, 12294, 64] }, flops: 4 * 12294 * 12294 * 64, note: '一个头，L=12294', eps: ['webgpu'] },
   { name: 'conv128',  file: 'onnx/conv128.onnx',    shape: { x: [1, 128, 128, 128] }, flops: 2 * 16384 * 128 * 128 * 9, note: 'fp32 3×3' },
+
+  // second pass: fp16 activations (q4f16) and one fused com.microsoft::Attention
+  { name: 'mm_qkv_f16', file: 'onnx/mm_qkv_f16_q4.onnx', shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 3072, note: 'int4 + fp16 激活', dtype: 'f16', eps: ['webgpu'] },
+  { name: 'mm_mlp_f16', file: 'onnx/mm_mlp_f16_q4.onnx', shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 4096, note: 'int4 + fp16 激活', dtype: 'f16', eps: ['webgpu'] },
+  { name: 'conv_f16',   file: 'onnx/conv128_f16.onnx',   shape: { x: [1, 128, 128, 128] }, flops: 2 * 16384 * 128 * 128 * 9, note: 'fp16 3×3', dtype: 'f16' },
+  { name: 'attn_fused', file: 'onnx/attn_fused.onnx',    shape: { input: [1, 12294, 1024] },
+    flops: 2 * 12294 * 1024 * 3072 + 4 * 12294 * 12294 * 1024, note: 'com.microsoft::Attention 16 头', eps: ['webgpu'] },
 ];
 
 async function bench(sess, feeds, rounds = 3) {
@@ -78,18 +91,16 @@ async function main() {
       continue;
     }
     const feeds = {};
-    for (const [k, s] of Object.entries(c.shape)) {
-      const n = s.reduce((a, b) => a * b, 1);
-      feeds[k] = new ort.Tensor('float32', (() => {
-        const a = new Float32Array(n);
-        let seed = 1;
-        for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; a[i] = seed / 0x7fffffff - 0.5; }
-        return a;
-      })(), s);
+    for (const [k, sh] of Object.entries(c.shape)) {
+      const n = sh.reduce((a, b) => a * b, 1);
+      const a = c.dtype === 'f16' ? new Float16Array(n) : new Float32Array(n);
+      let seed = 1;
+      for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; a[i] = seed / 0x7fffffff - 0.5; }
+      feeds[k] = new ort.Tensor(c.dtype === 'f16' ? 'float16' : 'float32', a, sh);
     }
 
     const line = [];
-    for (const ep of ['webgpu', 'wasm']) {
+    for (const ep of (c.eps || ['webgpu', 'wasm'])) {
       let sess;
       try {
         sess = await ort.InferenceSession.create(bytes, {
@@ -117,7 +128,8 @@ async function main() {
   row('对比基线', '手写 WGSL: int4 GEMM 1700 GFLOP/s · 融合 attention 1700 · 直接卷积 443', 'dim');
 }
 
-main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+main().then(() => { window.__done = true; })
+    .catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); window.__done = true; });
 </script>
 </body>
 </html>

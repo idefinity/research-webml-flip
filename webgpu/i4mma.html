@@ -42,17 +42,20 @@ const L = 12293;          // 一次 DiT 前向的 token 数
 const TK = 32;            // k 步长，同时是一个 scale block 的宽度
 
 /* ------------------------------------------------------------------ 内核
-   每个 workgroup 4 个 subgroup（128 线程），排成 2×2：
-   每个 subgroup 负责 TM/2 行 × TN/2 列，内部再切成 8×8 的累加块。
+   每个 workgroup 64 线程。这不是偷懒，是硬约束：
 
-   和标量版本的区别只有三处，但每一处都值钱：
-     1. A 只在装载时转一次 f16，之后由 MMA 消费；
-     2. int4 码值在装载 tile 时反量化，一块 tile 被 TM 行复用；
-     3. 累加结果直接从 MMA 落到 storage buffer（stride = n），
-        不经过 workgroup 暂存，也就没有 store/read 之间的屏障。 */
+   subgroup_matrix_result<f32, 8, 8> 在这台 metal-3 上，结果是 64 个 f32、
+   分布在 64 个 lane 上（每个 lane 一个元素）。一个 32 线程的 subgroup
+   只覆盖其中的一半（4×4），另一半归相邻的 subgroup。
+
+   所以「一个 8×8 累加器」天然由一整个 64 线程的 workgroup 承载，不能切给
+   单个 subgroup。128 线程分 4 个 subgroup、每个 subgroup 各算一个 8×8 的做法，
+   每个 8×8 都只算了 4×4 —— 结果静默地丢一半，对拍才会发现。
+
+   因此：workgroup_size = 64，一个 workgroup 算 TM×TN 的一个 tile，
+   里面所有 8×8 累加器都由这 64 个 lane 集体承载。 */
 function wgsl(TM, TN) {
-  const SUB_R = TM / 2, SUB_C = TN / 2;      // 每个 subgroup 的行列
-  const NR = SUB_R / 8, NC = SUB_C / 8;      // 每 subgroup 的累加块数
+  const NR = TM / 8, NC = TN / 8;      // 累加块的行列数
   const accs = [];
   for (let a = 0; a < NR; a++) for (let b = 0; b < NC; b++) accs.push([a, b]);
 
@@ -62,11 +65,11 @@ function wgsl(TM, TN) {
     body += `    {\n`;
     for (let a = 0; a < NR; a++) {
       body += `    let a${a} = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>` +
-              `(&tA, (sgR * ${SUB_R}u + ${a * 8}u) * ${TK}u + ${s}u, false, ${TK}u);\n`;
+              `(&tA, (${a * 8}u) * ${TK}u + ${s}u, false, ${TK}u);\n`;
     }
     for (let b = 0; b < NC; b++) {
       body += `    let b${b} = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>` +
-              `(&tB, (sgC * ${SUB_C}u + ${b * 8}u) * ${TK}u + ${s}u, true, ${TK}u);\n`;
+              `(&tB, (${b * 8}u) * ${TK}u + ${s}u, true, ${TK}u);\n`;
     }
     for (const [a, b] of accs) {
       body += `    c${a}${b} = subgroupMatrixMultiplyAccumulate(a${a}, b${b}, c${a}${b});\n`;
@@ -74,8 +77,8 @@ function wgsl(TM, TN) {
     body += `    }\n`;
   }
   for (const [a, b] of accs) {
-    store += `  subgroupMatrixStore(&C, (row0 + sgR * ${SUB_R}u + ${a * 8}u) * d.n` +
-             ` + col0 + sgC * ${SUB_C}u + ${b * 8}u, c${a}${b}, false, d.n);\n`;
+    store += `  subgroupMatrixStore(&C, (row0 + ${a * 8}u) * d.n` +
+             ` + col0 + ${b * 8}u, c${a}${b}, false, d.n);\n`;
   }
   return wgsl_head(TM, TN)
     .replace('__DECL__', decl)
@@ -83,9 +86,7 @@ function wgsl(TM, TN) {
     .replace('__STORE__', store);
 }
 
-// 上面那段把 loadA/loadB 和 main 分开写，是为了让累加器的生成留在 JS 里。
 function wgsl_head(TM, TN) {
-  const SUB_R = TM / 2, SUB_C = TN / 2;
   return /* wgsl */`
 enable f16;
 enable subgroups;
@@ -106,7 +107,7 @@ var<workgroup> tA: array<f16, ${TM * TK}>;
 var<workgroup> tB: array<f16, ${TN * TK}>;
 
 fn loadA(row0: u32, kidx: u32, lid: u32) {
-  for (var i: u32 = lid; i < ${TM * TK}u; i = i + 128u) {
+  for (var i: u32 = lid; i < ${TM * TK}u; i = i + 64u) {
     let r = i / ${TK}u;
     let c = i % ${TK}u;
     let g = row0 + r;
@@ -119,7 +120,7 @@ fn loadA(row0: u32, kidx: u32, lid: u32) {
 fn loadB(col0: u32, kidx: u32, lid: u32) {
   let wpr: u32 = d.k / 8u;
   let spr: u32 = d.k / 32u;
-  for (var i: u32 = lid; i < ${TN * (TK / 8)}u; i = i + 128u) {
+  for (var i: u32 = lid; i < ${TN * (TK / 8)}u; i = i + 64u) {
     let r = i / ${TK / 8}u;
     let w = i % ${TK / 8}u;
     let gr = col0 + r;
@@ -136,15 +137,11 @@ fn loadB(col0: u32, kidx: u32, lid: u32) {
   }
 }
 
-@compute @workgroup_size(128, 1, 1)
+@compute @workgroup_size(64, 1, 1)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,
-        @builtin(local_invocation_index) lid: u32,
-        @builtin(subgroup_size) sgsz: u32) {
+        @builtin(local_invocation_index) lid: u32) {
   let row0: u32 = wid.y * TM;
   let col0: u32 = wid.x * TN;
-  let sg: u32 = lid / sgsz;
-  let sgR: u32 = sg / 2u;
-  let sgC: u32 = sg % 2u;
 
 __DECL__
   for (var kidx: u32 = 0u; kidx < d.k; kidx = kidx + ${TK}u) {
@@ -217,7 +214,7 @@ async function main() {
     return W;
   }
 
-  const Variants = [[32, 64], [64, 64], [32, 128], [64, 128]];
+  const Variants = [[8, 32], [16, 32], [16, 64], [32, 64]];
   const pipes = new Map();
   for (const [tm, tn] of Variants) {
     const code = wgsl(tm, tn);
@@ -258,14 +255,15 @@ async function main() {
     return best;
   }
 
-  /* ---- 先在真权重上验一次：M=8 行、N=64 行、K 全宽，CPU 算参考 */
+  /* ---- 先在真权重上验一次：M=8 行、N=32 行、K 全宽，CPU 算参考 */
   {
     const t = man.tensors.find(x => x.name === 'blocks.0.attn.qkv');
     const p = packed(t);
-    // 只取前 64 行输出，K 全宽；打包布局按行连续，切起来正好
-    const q = p.q.slice(0, 64 * (t.k / 8));
-    const s = p.s.slice(0, 64 * (t.k / 32));
-    const W = dequant(q, s, 64, t.k, 64);
+    // 只取前 32 行输出，K 全宽；打包布局按行连续，切起来正好
+    const NCHK = 32;
+    const q = p.q.slice(0, NCHK * (t.k / 8));
+    const s = p.s.slice(0, NCHK * (t.k / 32));
+    const W = dequant(q, s, NCHK, t.k, NCHK);
     const M = 8;
     const A = new Float32Array(M * t.k);
     let seed = 3;
@@ -273,14 +271,13 @@ async function main() {
     for (let i = 0; i < A.length; i++) A[i] = rnd() * 0.1;
 
     const aBuf = buf(A, GPUBufferUsage.STORAGE);
-    const cBuf = dev.createBuffer({ size: 4 * 64 * M, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const cBuf = dev.createBuffer({ size: 4 * NCHK * M, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const wq = buf(q, GPUBufferUsage.STORAGE);
     const ws = buf(s, GPUBufferUsage.STORAGE);
-    const t2 = { wq, ws, n: 64, k: t.k };
+    const t2 = { wq, ws, n: NCHK, k: t.k };
 
-    // 复用计时函数，但 dispatch 用 M=8：把 L 换成 8 的临时版本
-    const pipe = pipes.get('32x64');
-    dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([M, 64, t.k, 0]));
+    const pipe = pipes.get('8x32');
+    dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([M, NCHK, t.k, 0]));
     const group = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: t2.wq } },
       { binding: 2, resource: { buffer: t2.ws } }, { binding: 3, resource: { buffer: cBuf } },
@@ -291,23 +288,22 @@ async function main() {
     pass.setPipeline(pipe); pass.setBindGroup(0, group);
     pass.dispatchWorkgroups(1, 1);
     pass.end();
-    const rb = dev.createBuffer({ size: 4 * 64 * M, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    enc.copyBufferToBuffer(cBuf, 0, rb, 0, 4 * 64 * M);
+    const rb = dev.createBuffer({ size: 4 * NCHK * M, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(cBuf, 0, rb, 0, 4 * NCHK * M);
     dev.queue.submit([enc.finish()]);
     await rb.mapAsync(GPUMapMode.READ);
     const got = new Float32Array(rb.getMappedRange().slice(0));
     rb.unmap();
 
     let num = 0, ref = 0;
-    for (let m = 0; m < M; m++) for (let n = 0; n < 64; n++) {
+    for (let m = 0; m < M; m++) for (let n = 0; n < NCHK; n++) {
       let acc = 0;
       for (let kk = 0; kk < t.k; kk++) acc += A[m * t.k + kk] * W[n * t.k + kk];
-      num = Math.max(num, Math.abs(acc - got[m * 64 + n]));
+      num = Math.max(num, Math.abs(acc - got[m * NCHK + n]));
       ref = Math.max(ref, Math.abs(acc));
     }
     const err = num / ref;
-    row('真权重对拍 M=8 N=64 K=1024', `max rel err ${err.toExponential(2)}`, err < 3e-2 ? 'ok' : 'bad');
-    // 出错时看一眼形状：是整行错、整列错，还是只有某些块错
+    row('真权重对拍 M=8 N=32 K=1024', `max rel err ${err.toExponential(2)}`, err < 3e-2 ? 'ok' : 'bad');
     const ref2 = (m, n) => {
       let acc = 0;
       for (let kk = 0; kk < t.k; kk++) acc += A[m * t.k + kk] * W[n * t.k + kk];
@@ -315,7 +311,7 @@ async function main() {
     };
     const fmt = (f) => Array.from({ length: 4 }, (_, i) => f(i).toFixed(4)).join(' ');
     log('want r0 ' + fmt((i) => ref2(0, i)) + ' | got r0 ' + fmt((i) => got[i]));
-    log('want r1 ' + fmt((i) => ref2(1, i)) + ' | got r1 ' + fmt((i) => got[64 + i]));
+    log('want r1 ' + fmt((i) => ref2(1, i)) + ' | got r1 ' + fmt((i) => got[NCHK + i]));
     log('want r0c8 ' + fmt((i) => ref2(0, 8 + i)) + ' | got r0c8 ' + fmt((i) => got[8 + i]));
   }
 
