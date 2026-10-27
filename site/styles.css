@@ -1,0 +1,432 @@
+/* 翻面 · 本地推理的界面
+   一套变量，两种性格：正常态（圆角、跟随系统字体、留白松弛），
+   思考态（等宽、零圆角、扫描线）——"降级"是这台机器真的没有余力装饰。 */
+
+:root {
+  --bg: #14130f;
+  --bg-deep: #0d0c09;
+  --ink: #ecebe6;
+  --ink-2: #b6b2a6;
+  --ink-3: #7d7a6f;
+  --line: #2b2a24;
+  --line-2: #3a382f;
+  --accent: #e8b26a;
+  --good: #7fd18a;
+  --bad: #e57b6b;
+
+  --pad: 28px;
+  --radius: 10px;
+  --tap: cubic-bezier(.2, .7, .2, 1);
+  --mono: ui-monospace, SFMono-Regular, Menlo, "SF Mono", monospace;
+  --sans: ui-sans-serif, -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+body { display: block; }
+
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: .01em; }
+.dim { color: var(--ink-3); }
+button { font: inherit; color: inherit; }
+
+/* ---------------------------------------------------------------- 壳 */
+
+.app {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.bar {
+  display: flex;
+  align-items: baseline;
+  gap: 20px;
+  padding: 20px var(--pad) 0;
+  z-index: 30;
+}
+
+.brand { display: flex; align-items: baseline; gap: 8px; }
+.brand b { font-weight: 600; letter-spacing: .12em; }
+.brand .sub { color: var(--ink-3); font-family: var(--mono); font-size: 11px; letter-spacing: .18em; text-transform: uppercase; }
+.mark {
+  width: 9px; height: 13px; display: inline-block;
+  border: 1.4px solid var(--ink);
+  border-radius: 1px;
+  transform: skewY(-12deg);
+}
+
+.claim { margin: 0; color: var(--ink-2); font-size: 13px; }
+.claim .dim { margin-left: 8px; }
+
+.meta {
+  margin-left: auto;
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+  letter-spacing: .04em;
+}
+.meta .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ink-3);
+  transition: background .3s;
+}
+body[data-gpu="ready"] .meta .dot { background: var(--good); }
+body[data-gpu="none"] .meta .dot { background: var(--bad); }
+
+/* ---------------------------------------------------------------- 阶段 */
+
+.stage {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .5s var(--tap), visibility .5s;
+}
+.stage.is-active { opacity: 1; visibility: visible; }
+
+/* ------------------------------------------------------- 0 · 权重加载 */
+
+.stage-boot {
+  place-items: center;
+  background: radial-gradient(120% 90% at 50% 40%, #191813 0%, var(--bg) 55%, var(--bg-deep) 100%);
+}
+
+.boot-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* 顶部压一层渐变，别让格子爬到标题上 */
+.stage-boot::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 132px;
+  background: linear-gradient(var(--bg) 12%, rgba(20, 19, 15, 0));
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* 没 WebGPU 时的替补：几条缓慢爬行的等宽刻度 */
+body[data-gpu="none"] .boot-canvas { display: none; }
+body[data-gpu="none"] .stage-boot::before {
+  content: "";
+  position: absolute;
+  inset: 18% 12%;
+  background-image: repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px 22px);
+  mask-image: radial-gradient(70% 60% at 50% 50%, #000 10%, transparent 78%);
+  animation: drift 9s linear infinite;
+  opacity: .55;
+}
+@keyframes drift { to { transform: translateX(22px); } }
+
+.boot-readout {
+  position: relative;
+  z-index: 2;
+  width: min(520px, 74vw);
+  display: grid;
+  gap: 14px;
+  padding: 22px 24px;
+  background: rgba(10, 9, 7, .88);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .45);
+  backdrop-filter: blur(6px);
+}
+
+.boot-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.boot-line .k { color: var(--ink-3); letter-spacing: .08em; }
+.boot-line .v { text-align: right; }
+.boot-line .v.num { color: var(--ink); }
+
+.boot-bar {
+  height: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+.boot-bar i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width .25s linear;
+}
+
+/* --------------------------------------------------------- 1 · 投图 */
+
+.stage-drop {
+  place-items: center;
+  align-content: center;
+  gap: 22px;
+  padding: var(--pad);
+}
+
+.drop {
+  width: min(620px, 86vw);
+  aspect-ratio: 16 / 10;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(80% 70% at 50% 45%, rgba(232, 178, 106, .05), transparent 70%),
+    rgba(255, 255, 255, .012);
+  cursor: pointer;
+  transition: border-color .25s, background .25s, transform .25s var(--tap);
+}
+.drop:hover, .drop:focus-visible, .drop.is-over {
+  border-color: var(--accent);
+  background:
+    radial-gradient(80% 70% at 50% 45%, rgba(232, 178, 106, .1), transparent 70%),
+    rgba(255, 255, 255, .02);
+  outline: none;
+}
+.drop.is-over { transform: scale(1.008); }
+
+.drop-inner { text-align: center; padding: 24px; }
+.drop-glyph { width: 56px; height: 56px; color: var(--ink-3); margin-bottom: 10px; }
+.drop-title { margin: 0 0 6px; font-size: 17px; letter-spacing: .02em; }
+.drop-hint { margin: 0; color: var(--ink-3); font-size: 12px; }
+.drop-rule { margin: 16px 0 0; color: var(--ink-3); font-size: 11px; letter-spacing: .04em; }
+
+.samples {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0; padding: 0; list-style: none;
+  font-size: 12px; color: var(--ink-3);
+}
+.samples-label { letter-spacing: .04em; }
+.samples button {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: border-color .2s, color .2s;
+}
+.samples button:hover { border-color: var(--accent); color: var(--ink); }
+
+/* ------------------------------------------------------- 2 · 思考 */
+
+.stage-think {
+  grid-auto-rows: min-content;
+  place-content: center;
+  justify-items: center;
+  gap: 26px;
+  padding: var(--pad);
+  background: var(--bg-deep);
+}
+
+.think-wrap {
+  position: relative;
+  width: min(460px, 70vmin);
+  aspect-ratio: 1;
+  border: 1px solid var(--line);
+}
+
+.think-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  filter: contrast(1.04) saturate(.94);
+}
+
+/* 扫描线：纯 CSS，零 GPU */
+.think-scan {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, .22) 0 1px,
+    transparent 1px 3px
+  );
+  mix-blend-mode: multiply;
+  opacity: .8;
+}
+
+.think-corner {
+  position: absolute;
+  width: 9px; height: 9px;
+  border: 1px solid var(--accent);
+  opacity: .7;
+}
+.think-corner.tl { left: -1px; top: -1px; border-right: 0; border-bottom: 0; }
+.think-corner.tr { right: -1px; top: -1px; border-left: 0; border-bottom: 0; }
+.think-corner.bl { left: -1px; bottom: -1px; border-right: 0; border-top: 0; }
+.think-corner.br { right: -1px; bottom: -1px; border-left: 0; border-top: 0; }
+
+.think-readout {
+  width: min(460px, 70vmin);
+  display: grid;
+  gap: 10px;
+}
+.think-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.think-phase { color: var(--ink); }
+.think-res { margin-left: auto; color: var(--ink-3); }
+.think-pct { color: var(--accent); min-width: 4ch; text-align: right; }
+
+.think-bar { height: 2px; background: var(--line); }
+.think-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
+
+.think-note {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  letter-spacing: .04em;
+}
+
+/* 整页降级：等宽、零圆角、去掉一切柔软的东西 */
+body[data-stage="think"] { font-family: var(--mono); }
+body[data-stage="think"] .claim,
+body[data-stage="think"] .samples,
+body[data-stage="think"] .boot-readout { opacity: .55; }
+body[data-stage="think"] .stage-drop { display: none; }
+
+/* ------------------------------------------------------- 3 · 结果 */
+
+.stage-view {
+  grid-template-rows: 1fr auto;
+  background:
+    radial-gradient(90% 70% at 50% 38%, #1b1a15 0%, var(--bg) 60%, var(--bg-deep) 100%);
+}
+
+.view-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+  touch-action: none;
+}
+.view-canvas:active { cursor: grabbing; }
+
+.view-hud {
+  position: absolute;
+  left: var(--pad); right: var(--pad); bottom: 18px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  pointer-events: none;
+}
+.view-hud > * { pointer-events: auto; }
+
+.view-left { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--ink-3); }
+.az-label { letter-spacing: .1em; }
+.az-bar {
+  position: relative;
+  width: min(240px, 34vw);
+  height: 2px;
+  background: var(--line);
+}
+.az-bar i { display: block; height: 100%; width: 0; background: var(--accent); }
+.az-bar b {
+  position: absolute; top: -2px; width: 1px; height: 6px;
+  background: var(--ink-3); left: 50%;
+}
+.az-val { color: var(--ink-2); min-width: 5ch; }
+
+.view-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+.view-hint { margin: 0; font-size: 11px; color: var(--ink-3); }
+
+.ghost {
+  background: none;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: border-color .2s, color .2s;
+}
+.ghost:hover { border-color: var(--accent); color: var(--ink); }
+
+.view-fallback {
+  position: absolute;
+  inset: auto 0 50% 0;
+  margin: 0 auto;
+  padding: 0 24px;
+  max-width: 36ch;
+  text-align: center;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+/* ---------------------------------------------------------------- 脚注 */
+
+.foot {
+  position: fixed;
+  left: var(--pad); right: var(--pad); bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-3);
+  letter-spacing: .03em;
+  pointer-events: none;
+  z-index: 40;
+}
+body[data-stage="view"] .foot { display: none; }
+
+/* ---------------------------------------------------------------- 适配 */
+
+@media (max-width: 760px) {
+  :root { --pad: 16px; }
+  .bar { flex-wrap: wrap; gap: 8px 14px; }
+  .claim { order: 3; width: 100%; font-size: 12px; }
+  .meta { order: 2; }
+  .drop { aspect-ratio: 4 / 3; }
+  .stage-think { gap: 18px; }
+  .think-wrap, .think-readout { width: min(78vw, 70vmin); }
+  .view-hud { flex-direction: column; align-items: stretch; gap: 10px; bottom: 12px; }
+  .view-right { margin-left: 0; justify-content: space-between; }
+  .foot { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+/* 没有 JS 的时候，至少读到一句话 */
+body:not([data-booted]) .stage-boot .boot-readout::after {
+  content: "需要 JavaScript 才能加载模型。";
+  display: block;
+  margin-top: 8px;
+  color: var(--bad);
+  font-size: 12px;
+}

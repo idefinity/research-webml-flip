@@ -788,6 +788,29 @@ SPZ 之类的压缩格式值得看一眼——首访要下 900 MB 权重，导�
 
 ---
 
+### 1.6 前端：三段等待，一个承诺（`site/`）
+
+页面一共四段，每一段对 GPU 的态度都不一样。这是这个应用唯一的设计主张：**等待的时间不该花钱，该花钱的地方别省。**
+
+| 段 | GPU | 为什么 |
+|---|---|---|
+| 权重加载 | 独占 | 反正没别的活干。给一个真的动画：格子按进度翻面，一条亮带扫过去，扫到哪儿就是加载到哪儿 |
+| 投图 | 空闲 | 只有 `createImageBitmap`。图不出浏览器，一次网络请求都没有 |
+| 思考 | **零提交** | 推理要整个队列，所以这一段一个 WebGPU 任务都不发。像素阶梯用 Canvas2D 画：分辨率 20→126、色阶 5→8，**分辨率本身就是进度条** |
+| 结果 | 独占 | 高斯泼溅，65,536 点，1280×820 下 **60 fps**（M5 8 核） |
+
+三条约定写进代码注释，也写在这儿，因为改的人容易破坏：
+
+1. **图片不出浏览器。** 唯一的 `fetch` 是示例图和预烘焙 PLY。用户选的图走 `File` → `createImageBitmap`。
+2. **思考态让出 GPU。** `think.js` 只有 Canvas2D。这条不写在纸上就没意义——它得是一条能被人一眼看穿的约束。
+3. **无构建、无 CDN。** 原生 ES module 加一个 CSS 文件，`python3 -m http.server` 就能跑。加一个依赖，第一条之外的约定全部松动。
+
+结果页的舞台按阶段 2 的方向先铺了一层底：转台环 + 接触阴影 + 渐晕 + 方位角进度条（0–100%）。拖拽翻面、滚轮远近、双击复位。渲染是标准 EWA：视空间协方差投影成 2×2、特征分解出两根轴、每根 2σ、前乘 alpha 从远到近。排序在 CPU，计数排序 O(n)，65K 点约 2 ms。
+
+**演示接缝只有一处**：`site/src/pipeline.js` 的 `loadWeights` / `runInference`。`MODE === 'demo'` 时任何输入都落到预烘焙的 `building_stone_house_t20.ply`，页脚写着"推理尚未接线"。接真管线时改 `MODE`、UI 一行不动。**那行脚注在接线之前不许删。**
+
+---
+
 ## 阶段 2（2–3 周）：把手办感做成风格
 
 这一节是整份计划里最反直觉的。模型不够好的时候，本能是继续调模型；这里应该反过来，**把“它被压成了一尊小雕像”做成产品的视觉语言。**
@@ -896,7 +919,8 @@ github.com/idefinity/research-webml-flip   ← 公开仓库，GPL-3.0
 │  ├─ k0_onnx_probe.py                    ← 探针本体
 │  ├─ kaggle_kernel_body.py               ← kernel 正文：pip / clone / 权重 / 拉取
 │  └─ k1_quantize_bundle.py  k2_step_distill.py   ← 待写
-└─ site/                                  ← 待建，Pages 源
+├─ webgpu/                                ← 内核试验台，一页一个实验（见 K2n）
+└─ site/                                  ← 前端，四段流程（见 1.6）
 
 huggingface.co/idefinity/flip-splat-int4   ← 权重，几百 MB 无所谓
 ├─ encoder.onnx  vae_decoder.onnx  dit_2step_int4.onnx  gaussian_decoder.onnx

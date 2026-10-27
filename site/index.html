@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>翻面 · 一张照片，一尊手办</title>
+<meta name="description" content="本地推理的单图转 3D 高斯。图片不上传，权重在浏览器里，翻面在浏览器里。" />
+<meta name="theme-color" content="#14130f" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 7h16v10H4z' fill='none' stroke='%23ecebe6' stroke-width='1.4'/%3E%3Cpath d='M12 7v10' stroke='%23ecebe6' stroke-width='1.4'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body data-stage="boot" data-gpu="pending">
+
+<main class="app">
+
+  <header class="bar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <b>翻面</b>
+      <span class="sub">flip</span>
+    </div>
+    <p class="claim">一张照片，一尊手办。<span class="dim">图片不离开浏览器。</span></p>
+    <div class="meta" id="meta">
+      <span class="dot" aria-hidden="true"></span>
+      <span id="meta-text">正在准备</span>
+    </div>
+  </header>
+
+  <!-- 0 · 权重加载：唯一的"可以随便用 GPU"的阶段 -->
+  <section class="stage stage-boot" id="stage-boot" aria-label="加载模型权重">
+    <canvas class="boot-canvas" id="boot-canvas"></canvas>
+    <div class="boot-readout">
+      <div class="boot-line">
+        <span class="k">权重</span>
+        <span class="v" id="boot-tiers">DINOv3 · VAE · DiT · 八叉树 · GS 解码器</span>
+      </div>
+      <div class="boot-bar"><i id="boot-fill"></i></div>
+      <div class="boot-line">
+        <span class="k" id="boot-phase">连接</span>
+        <span class="v num" id="boot-bytes">0.0 MB / 902 MB</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 1 · 投图：拖进来、点一下、或者粘贴 -->
+  <section class="stage stage-drop" id="stage-drop" aria-label="选择一张照片">
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="选择或拖入一张照片">
+      <div class="drop-inner">
+        <svg class="drop-glyph" viewBox="0 0 64 64" aria-hidden="true">
+          <rect x="8" y="14" width="48" height="36" rx="2" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M32 14v36" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 4"/>
+          <circle cx="22" cy="26" r="3" fill="currentColor" opacity=".55"/>
+        </svg>
+        <p class="drop-title">把照片丢进来</p>
+        <p class="drop-hint">或者点击选择 · 也可以直接粘贴 · 只在本机解码</p>
+        <p class="drop-rule">单人、侧身、背景干净，效果最好</p>
+      </div>
+    </div>
+    <ul class="samples" id="samples" aria-label="没有照片？用一张现成的">
+      <li class="samples-label">没有照片：</li>
+    </ul>
+    <input type="file" id="file" accept="image/*" hidden />
+  </section>
+
+  <!-- 2 · 思考：UI 降级成像素，GPU 全部让给推理 -->
+  <section class="stage stage-think" id="stage-think" aria-label="正在推理">
+    <div class="think-wrap">
+      <canvas class="think-canvas" id="think-canvas"></canvas>
+      <div class="think-scan" aria-hidden="true"></div>
+      <div class="think-corner tl" aria-hidden="true"></div>
+      <div class="think-corner tr" aria-hidden="true"></div>
+      <div class="think-corner bl" aria-hidden="true"></div>
+      <div class="think-corner br" aria-hidden="true"></div>
+    </div>
+    <div class="think-readout">
+      <div class="think-row">
+        <span class="think-phase" id="think-phase">预处理</span>
+        <span class="think-res num" id="think-res">16 × 16</span>
+        <span class="think-pct num" id="think-pct">0%</span>
+      </div>
+      <div class="think-bar"><i id="think-fill"></i></div>
+      <p class="think-note" id="think-note">GPU 已让位。此刻它属于推理。</p>
+    </div>
+  </section>
+
+  <!-- 3 · 结果：真正的高斯 -->
+  <section class="stage stage-view" id="stage-view" aria-label="结果">
+    <canvas class="view-canvas" id="view-canvas"></canvas>
+    <div class="view-hud">
+      <div class="view-left">
+        <span class="az-label">方位</span>
+        <div class="az-bar"><i id="az-fill"></i><b id="az-tick"></b></div>
+        <span class="az-val num" id="az-val">0°</span>
+      </div>
+      <div class="view-right">
+        <button class="ghost" id="btn-replay" type="button">再来一张</button>
+        <p class="view-hint" id="view-hint">拖拽翻面 · 滚轮远近 · 双击复位</p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span id="foot-mode">演示管线：推理尚未接线，结果来自预烘焙 PLY</span>
+  <span class="dim" id="foot-gpu"></span>
+</footer>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

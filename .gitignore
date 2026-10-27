@@ -19,8 +19,9 @@ k1/
 k2/
 fetched_script.py
 
-# playwright-cli scratch (console logs / page snapshots)
+# playwright-cli scratch (console logs / page snapshots / screenshots)
 webgpu/.playwright-cli/
+.playwright-cli/
 webgpu/manifest.json
 webgpu/int4.bin
 webgpu/manifest.json
