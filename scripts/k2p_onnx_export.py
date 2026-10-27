@@ -272,10 +272,12 @@ try:
              torch.randn(B, LC2, args["cond2_channels"]),
              torch.tensor([500.0]))
     names = ["latent", "camera", "feature1", "feature2", "t"]
-    dyn = {n: {0: "B"} for n in names}
-    dyn["latent"][1] = "LQ"
-    dyn["feature1"][1] = "LC1"
-    dyn["feature2"][1] = "LC2"
+    # Static on purpose. The flow model normalises with `h.shape[-1:]` and slices
+    # with `z.shape[1]`, and under dynamic_axes those become a Gather feeding a
+    # ListConstruct, which the exporter refuses as "not constant". Nothing here
+    # runs at any other shape anyway: 8192 latent + 4101 + 4101 cond + 1 camera is
+    # what this architecture is.
+    dyn = None
 
     fp32 = f"{W}/dit.fp32.onnx"
     p("wrapper forward once, so a tracing failure is not mistaken for a model bug")
@@ -325,14 +327,15 @@ try:
     # ---- the quantised graph has to compute the same thing
     import numpy as np
     import onnxruntime as ort
-    small = (np.random.rand(1, 256, args["in_channels"]).astype("float32"),
+    small = (np.random.rand(1, LQ, args["in_channels"]).astype("float32"),
              np.random.rand(1, 1, args["cam_channels"]).astype("float32"),
-             np.random.rand(1, 64, args["cond_channels"]).astype("float32"),
-             np.random.rand(1, 64, args["cond2_channels"]).astype("float32"),
+             np.random.rand(1, LC1, args["cond_channels"]).astype("float32"),
+             np.random.rand(1, LC2, args["cond2_channels"]).astype("float32"),
              np.array([500.0], dtype="float32"))
     feeds = dict(zip(names, small))
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    p("  running both graphs on CPU at full shape (minutes, not seconds) ...")
     a = ort.InferenceSession(fp32, so, providers=["CPUExecutionProvider"]).run(None, feeds)
     b = ort.InferenceSession(int4, so, providers=["CPUExecutionProvider"]).run(None, feeds)
     for i, nm in enumerate(["latent", "camera"]):
