@@ -290,9 +290,16 @@ def pick_images():
     cannot tell "the image does not matter" from "these images are alike".
     """
     exts = (".png", ".jpg", ".jpeg", ".webp")
-    ex_dir = REPO / "examples"
-    grp_a = [p for p in sorted(ex_dir.glob("*")) if p.suffix.lower() in exts] \
-        if ex_dir.exists() else []
+    # the upstream examples live in static/example_inputs, not examples/ -
+    # getting this wrong silently empties the control group, and a camera test
+    # with only one content class cannot distinguish "the image does not
+    # matter" from "these images are alike"
+    ex = REPO / "static" / "example_inputs"
+    grp_a = [p for p in sorted(ex.glob("*")) if p.suffix.lower() in exts] \
+        if ex.is_dir() else []
+    if not grp_a and (REPO / "static").is_dir():
+        grp_a = [p for p in sorted((REPO / "static").rglob("*"))
+                 if p.suffix.lower() in exts]
     in_dir = OUT / "inputs"
     grp_b = [p for p in sorted(in_dir.glob("*")) if p.suffix.lower() in exts] \
         if in_dir.exists() else []
