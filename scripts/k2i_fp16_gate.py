@@ -142,15 +142,22 @@ def norm_census(model):
 # ---------------------------------------------------------------------------
 
 class FlowAdapter(nn.Module):
-    """Same wrapper K0b exported from, so the graph is comparable."""
+    """Same wrapper shape K0b exported from, one deliberate difference.
+
+    K0b multiplied t by 1000 because it assumed the sampler works in [0,1].
+    It does not: the trace records t in the hundreds (1000/750/500/250) and
+    k2e's forward_velocity passes those through untouched. Multiplying again
+    hands the module t=1e6 - finite in fp32, so the reference looks plausible
+    while being garbage, and instant inf in fp16. That is exactly the failure
+    this run's first attempt produced, and it was the harness, not the model.
+    """
 
     def __init__(self, m):
         super().__init__()
         self.m = m
 
     def forward(self, latent, camera, t, feat1, feat2):
-        out = self.m({"latent": latent, "camera": camera},
-                     t * 1000.0,
+        out = self.m({"latent": latent, "camera": camera}, t,
                      {"feature1": feat1, "feature2": feat2})
         return out["latent"], out["camera"]
 
@@ -256,6 +263,10 @@ def compare(a, b):
                 x, y, dim=0).item(), 6),
             "rel_l2": round(((x - y).norm() / y.norm()).item(), 6),
             "max_abs": round((x - y).abs().max().item(), 4),
+            # a nan here with a finite reference means the fp16 side hit inf,
+            # which is a real overflow and not a harness bug - so record the
+            # magnitude that produced it
+            "out_max": round(y.abs().max().item(), 2),
         })
     return out
 
@@ -336,25 +347,50 @@ def main():
             torch.cuda.synchronize()
             rec["fp16_ms"] = round((time.time() - t0) * 1000, 1)
 
+            # the deployable configuration: fp16 math with fp32 master weights,
+            # which is what autocast does and what a WebGPU port would have to
+            # emulate (f16 storage, f32 accumulate). Pure fp16 weights are the
+            # aggressive end; this is the one a browser could actually ship.
+            adapter.float()
+            torch.cuda.synchronize()
+            t0 = time.time()
+            with torch.autocast("cuda", torch.float16, cache_enabled=False):
+                r_am = adapter(*[x.float() for x in a32])
+            torch.cuda.synchronize()
+            rec["autocast_ms"] = round((time.time() - t0) * 1000, 1)
+
         rec["speedup"] = round(rec["fp32_ms"] / max(rec["fp16_ms"], 1e-6), 3)
         rec["channels"] = compare(r16, r32)
+        rec["channels_autocast"] = compare(r_am, r32)
         worst = min(c["cos"] for c in rec["channels"])
+        worst_am = min(c["cos"] for c in rec["channels_autocast"])
         rec["worst_cos"] = worst
+        rec["worst_cos_autocast"] = worst_am
         rec["passes"] = worst >= 0.999
+        rec["passes_autocast"] = worst_am >= 0.999
         R["snapshots"].append(rec)
         note(f"  {rec['which']:>5} t={rec['t']:<8} "
              f"fp32 {rec['fp32_ms']}ms  fp16 {rec['fp16_ms']}ms  "
-             f"{rec['speedup']}x  worst cos {worst:.6f}  "
-             f"{'PASS' if rec['passes'] else 'FAIL'}")
+             f"{rec['speedup']}x  autocast {rec['autocast_ms']}ms")
+        for tag, w, okk in (("pure fp16", worst, rec["passes"]),
+                            ("autocast ", worst_am, rec["passes_autocast"])):
+            note(f"      {tag} worst cos {w:.6f}  "
+                 f"{'PASS' if okk else 'FAIL'}")
         for c in rec["channels"]:
-            note(f"          cos {c['cos']:.6f}  rel-l2 {c['rel_l2']:.5f}  "
-                 f"max|d| {c['max_abs']}")
+            note(f"          fp16     cos {c['cos']:.6f}  rel-l2 "
+                 f"{c['rel_l2']:.5f}  max|d| {c['max_abs']}  out_max "
+                 f"{c['out_max']}")
+        for c in rec["channels_autocast"]:
+            note(f"          autocast cos {c['cos']:.6f}  rel-l2 "
+                 f"{c['rel_l2']:.5f}  max|d| {c['max_abs']}")
         save()
-        del r32, r16
+        del r32, r16, r_am
         torch.cuda.empty_cache()
 
     R["fp16_ok"] = all(s["passes"] for s in R["snapshots"])
-    note(f"fp16 gate: {'PASS' if R['fp16_ok'] else 'FAIL'}")
+    R["autocast_ok"] = all(s["passes_autocast"] for s in R["snapshots"])
+    note(f"fp16 gate:      {'PASS' if R['fp16_ok'] else 'FAIL'}")
+    note(f"autocast gate:  {'PASS' if R['autocast_ok'] else 'FAIL'}")
     save()
 
     if not DO_EXPORT:
