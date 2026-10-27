@@ -145,7 +145,7 @@ try:
     # numpy, torch, safetensors, PIL, torchvision, tqdm. Install the ones that
     # might be missing and continue either way - the import below is the real
     # check, and a failed pip should not be the thing that ends the run.
-    reqs = ["safetensors", "torchvision", "tqdm"]
+    reqs = ["safetensors", "torchvision", "tqdm", "onnxscript"]
     r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q"] + reqs,
                        capture_output=True, text=True, timeout=1200)
     p("pip reqs rc", r.returncode, (r.stderr or "")[-300:].replace("\n", " "))
@@ -155,6 +155,53 @@ try:
     sys.path.insert(0, f"{W}/TripoSplat")
     import triposplat as T
     import model as M
+
+    # ------------------------------------------------------------------ rope
+    # RePo3DRotaryEmbedding builds its rotation as torch.polar(1, ang) -> complex64
+    # and applies it with view_as_complex / complex multiply. Neither aten::polar
+    # nor view_as_complex has an ONNX symbolic, and opset 17 has no complex type,
+    # so the export dies on the rope and never reaches the matmuls.
+    #
+    # Multiplying by e^{i theta} is a 2x2 rotation, so the same thing in real
+    # arithmetic: (a + ib) * (cos + i sin) = (a cos - b sin) + i(a sin + b cos).
+    # The two functions below are exchanged for the originals, and the kernel
+    # checks they agree before exporting anything.
+    def _rope_real(self, hidden_states):
+        h = self.norm(hidden_states)
+        feat = self.act(self.gate_map(h)) * self.content_map(h)
+        out = self.final_map(feat)
+        B, L, _ = out.shape
+        delta_pos = out.reshape(B, L, self.num_heads, 3)
+        ang_0 = M.clamp_mul(delta_pos[..., 0].unsqueeze(-1), self.freqs_0) * torch.pi
+        ang_1 = M.clamp_mul(delta_pos[..., 1].unsqueeze(-1), self.freqs_1) * torch.pi
+        ang_2 = M.clamp_mul(delta_pos[..., 2].unsqueeze(-1), self.freqs_2) * torch.pi
+        ang = torch.cat([ang_0, ang_1, ang_2], dim=-1).float()
+        return torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1)   # [B, L, H, hd/2, 2]
+
+    def _apply_rope_real(hidden_states, freqs):
+        cos, sin = freqs[..., 0], freqs[..., 1]
+        x = hidden_states.float().reshape(*hidden_states.shape[:-1], -1, 2)
+        a, b = x[..., 0], x[..., 1]
+        out = torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1)
+        return out.reshape(*hidden_states.shape).type_as(hidden_states)
+
+    _orig_rope = M.RePo3DRotaryEmbedding.forward
+    _orig_apply = M.apply_rotary_emb
+    M.RePo3DRotaryEmbedding.forward = _rope_real
+    M.apply_rotary_emb = _apply_rope_real
+
+    # prove the substitution, on a small random case, before trusting it
+    torch.manual_seed(0)
+    _rl = M.RePo3DRotaryEmbedding(64, 4, 16).eval()
+    _h = torch.randn(1, 7, 64)
+    with torch.no_grad():
+        _f = _rl(_h)
+        _a = _apply_rope_real(_h.reshape(1, 7, 4, 16), _f)
+        _f0 = _orig_rope(_rl, _h)
+        _b = _orig_apply(_h.reshape(1, 7, 4, 16), _f0)
+    p("rope substitution: max |real - complex| =",
+      float((_a - _b).abs().max()), "| magnitudes", float(_b.abs().max()))
+    del _rl, _h, _f, _a, _f0, _b
 
     p("torch", torch.__version__)
     args = dict(T.FLOW_MODEL_ARGS)
