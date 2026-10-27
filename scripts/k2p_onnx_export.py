@@ -101,9 +101,11 @@ try:
                    capture_output=True, text=True, timeout=600)
     subprocess.run(["git", "-C", f"{W}/TripoSplat", "checkout", "-q", UPSTREAM_SHA],
                    capture_output=True, text=True, timeout=300)
-    with open(f"{W}/TripoSplat/requirements.txt") as f:
-        reqs = [r.strip() for r in f if r.strip() and not r.startswith("#")]
-    p("requirements:", " ".join(reqs)[:300])
+    # The repo ships four files and no requirements.txt; the imports are
+    # numpy, torch, safetensors, PIL, torchvision, tqdm. Install the ones that
+    # might be missing and continue either way - the import below is the real
+    # check, and a failed pip should not be the thing that ends the run.
+    reqs = ["safetensors", "torchvision", "tqdm"]
     r = subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-q"] + reqs,
                        capture_output=True, text=True, timeout=1200)
     p("pip reqs rc", r.returncode, (r.stderr or "")[-300:].replace("\n", " "))
