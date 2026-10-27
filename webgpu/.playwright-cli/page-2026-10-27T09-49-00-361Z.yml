@@ -1,0 +1,17 @@
+- generic [active] [ref=e1]:
+  - heading "flash attention · WebGPU" [level=1] [ref=e2]
+  - paragraph [ref=e3]: 一个 workgroup 负责「一个 head × 64 个 query 行」，键方向按 64 分块，online softmax，全部按 vec4 读写。对应 DiT 里 12293 token 的全自注意力。
+  - table [ref=e4]:
+    - rowgroup [ref=e5]:
+      - row [ref=e6]:
+        - columnheader "stage" [ref=e7]
+        - columnheader "result" [ref=e8]
+    - row [ref=e9]:
+      - cell "adapter" [ref=e10]
+      - cell "apple metal-3" [ref=e11]
+    - row [ref=e12]:
+      - cell "shader-f16" [ref=e13]
+      - cell "yes" [ref=e14]
+    - row [ref=e15]:
+      - cell "shader" [ref=e16]
+      - cell "compiled" [ref=e17]

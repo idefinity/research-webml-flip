@@ -341,9 +341,17 @@ async function main() {
   const small = await run(40, 2, 64, true);
   row('check L=40 H=2', `max|gpu-cpu| = ${small.err.toExponential(2)}`, small.err < 2e-3 ? 'ok' : 'bad');
 
+  // min of three: a single dispatch moves 10-15% run to run, which is more
+  // than the differences being compared here
+  const bench = async (L, H) => {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) best = Math.min(best, (await run(L, H, 64, false, 0)).ms);
+    return best;
+  };
   for (const [L, H] of [[4096, 16], [8192, 16], [12293, 16]]) {
-    const r = await run(L, H, 64, false);
-    row(`attn L=${L} H=${H} d=64`, `${r.ms.toFixed(1)} ms · ${(r.flops / (r.ms * 1e6)).toFixed(0)} GFLOP/s`);
+    const ms = await bench(L, H);
+    const flops = 4 * L * L * 64 * H;
+    row(`attn L=${L} H=${H} d=64`, `${ms.toFixed(1)} ms · ${(flops / (ms * 1e6)).toFixed(0)} GFLOP/s`);
   }
   const full = await run(12293, 16, 64, false, 0);
   const onlyS = await run(12293, 16, 64, false, 1);

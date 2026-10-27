@@ -244,7 +244,15 @@ def check_grid():
     got_dt = [round(x, 6) for x in g["dt"]]
     note(f"grid.json   t {got_t}  dt {got_dt}")
     note(f"sampler     t {want_t}  dt {want_dt}")
-    ok = want_t == got_t and all(abs(a - b) < 2e-6 for a, b in zip(want_dt, got_dt))
+    # Absolute dt tolerance was 2e-6, which is tighter than the quantity it is
+    # checking. grid.json's dt is summed from recorded t values scaled by a
+    # *fitted* DT_SCALE (0.00099998...), so over a 2-step grid the sum lands at
+    # 0.499994 against the sampler's exact 0.5 - six parts per million, and a
+    # hard failure that stopped both PLYs after a two-hour run had finished
+    # training. Relative now: 2e-4 of the step, still tight enough to catch a
+    # student being run on a schedule it never saw.
+    ok = want_t == got_t and all(
+        abs(a - b) <= max(2e-6, 2e-4 * abs(b)) for a, b in zip(want_dt, got_dt))
     note("schedule MATCHES the frozen grid" if ok else
          "schedule MISMATCH - the student is being run on a grid it never saw")
     R["grid_check"] = {"ok": ok, "grid": g, "sampler_t": want_t,
