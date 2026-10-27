@@ -7,7 +7,11 @@ The 5 zero tokens the encoder pads in front of the VAE features are inside the
 graph, so a caller hands over what the VAE actually produced.
 
 The safetensors repo is a weight file: to run it you need the architecture, the
-sampler constants and our packing convention. An ONNX graph is the other half -
+sampler constants and our packing convention.
+
+Produced dit.int4.onnx: 6265 nodes, 294 MB, 203 MatMulNBits. The 56 MatMuls that
+stayed fp32 are exactly the 28 attention layers' QK^T and PV - they have no
+weights to quantise. fp32 graph was 1517 MB, tracing took 288 s. An ONNX graph is the other half -
 it carries the structure, and with MatMulNBits it carries the 4-bit weights too,
 so ORT-web can load it directly.
 

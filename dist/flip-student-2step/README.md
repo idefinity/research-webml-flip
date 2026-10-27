@@ -28,8 +28,42 @@ T4 上出图从 91–95 秒降到 4.6–5.0 秒（19×），权重从 1.48 GB �
 | 文件 | 内容 |
 |---|---|
 | `model.safetensors` | 763 个张量：204 个 int4（U8 成对）+ 204 个 fp16 scale + 355 个 fp16（norm/bias/embedding） |
+| `dit.int4.onnx` | 同一个模型，整图 ONNX：203 个 `com.microsoft::MatMulNBits` + 剩下的 fp32 |
 | `quantize.json` | 量化语义：4 bit、每 32 权重一个 fp16 scale、对称、zero point 8、沿 K 打包 |
 | `config.json` | 结构参数与采样参数 |
+
+## `dit.int4.onnx`
+
+静态形状，输入是编码器的原始输出：
+
+```
+latent   [1, 8192, 16]     噪声 / 当前状态
+camera   [1, 1, 5]
+feature1 [1, 4101, 1280]   DINOv3
+feature2 [1, 4096, 128]    Flux2 VAE（图内部补 5 个零 token，对齐 4101）
+t        [1]
+-> out_latent [1, 8192, 16], out_camera [1, 1, 5]
+```
+
+6265 个节点，294 MB。259 个 MatMul 里 203 个变成了 int4；**剩下的 56 个就是 28 层注意力的
+QKᵀ 和 PV**——它们没有权重，量化不到，也不该量化。
+
+**这张图不是最快的路径，是最互通的路径。** 在 ORT-web 1.31.1 / apple metal-3 上实测
+（`webgpu/onnx-probe.html`）：
+
+| 图 | ORT WebGPU | 我们的 WGSL |
+|---|---|---|
+| int4 MatMulNBits 1024→3072 @12294 | 789 GFLOP/s | 1591–1796 |
+| 注意力，1 头 L=12294（物化） | 406 | 1789 |
+| `com.microsoft::Attention` 16 头 | 1023 | 1789 |
+| 卷积 3×3 128→128 @128² | 711 | 443 |
+
+也就是说：矩阵乘交给 ORT 是 2.3 倍代价，注意力是 4.4 倍。**想跑进 60 秒，注意力得用
+我们自己的核**，靠 `preferredOutputLocation: 'gpu-buffer'` 和 ORT 交接；其余走 ONNX。
+卷积反而是 ORT 更快，所以 VAE 就该用 ONNX。
+
+这张图在 CPU 上没有端到端跑过（一次前向 5 分钟，内核撑不住）。int4 的正确性证据是
+矩阵乘级别的：fp32 对比 int4，cosine 0.997、rel_l2 0.073。
 
 ## 怎么接进上游
 
