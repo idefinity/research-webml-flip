@@ -1,0 +1,118 @@
+[   40466ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40466ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40501ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40504ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40504ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40504ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40580ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40580ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   40580ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69795ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69795ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69797ms] [LOG] mismatch (idx, gpu, cpu): [[0,"0.0000","-0.0748"],[1,"0.0000","-0.1484"],[2,"0.0000","0.0157"],[3,"0.0000","0.0472"],[4,"0.0000","-0.0613"],[5,"0.0000","0.0187"]] @ http://127.0.0.1:8790/int4-gemm.html:135
+[   69834ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69838ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69838ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69838ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69910ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69910ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[   69910ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103750ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103750ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103750ms] [LOG] As[0..7]  0.000 0.000 0.000 0.000 0.000 0.000 0.000 0.000 @ http://127.0.0.1:8790/int4-gemm.html:140
+[  103750ms] [LOG] Bs[0..7]  0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 0.0000 @ http://127.0.0.1:8790/int4-gemm.html:140
+[  103750ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103755ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103757ms] [LOG] mismatch (idx, gpu, cpu): [[0,"0.0000","-0.0206"],[1,"0.0000","0.1322"],[2,"0.0000","0.1008"],[3,"0.0000","-0.0894"],[4,"0.0000","0.0623"],[5,"0.0000","-0.0325"]] @ http://127.0.0.1:8790/int4-gemm.html:140
+[  103794ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103794ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103797ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103797ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103797ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103875ms] [WARNING] The total use of workgroup storage (24576 bytes) is larger than the maximum allowed (16384 bytes). This adapter supports a higher maxComputeWorkgroupStorageSize of 32768, which can be specified in requiredLimits when calling requestDevice(). Limits differ by hardware, so always check the adapter limits prior to requesting a higher limit.
+ - While initializing [ComputePipeline (unlabeled)]
+ - While calling [Device].CreateComputePipeline([ComputePipelineDescriptor]).
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103875ms] [WARNING] [Invalid ComputePipeline (unlabeled)] is invalid due to a previous error.
+ - While encoding [ComputePassEncoder (unlabeled)].SetPipeline([Invalid ComputePipeline (unlabeled)]).
+ - While finishing [CommandEncoder (unlabeled)].
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  103875ms] [WARNING] [Invalid CommandBuffer] is invalid due to a previous error.
+ - While calling [Queue].Submit([[Invalid CommandBuffer]])
+ @ http://127.0.0.1:8790/int4-gemm.html:0
+[  126254ms] [LOG] As[0..7]  -0.310 0.069 0.173 0.362 0.072 0.193 -0.414 0.434 @ http://127.0.0.1:8790/int4-gemm.html:140
+[  126254ms] [LOG] Bs[0..7]  -0.0357 -0.0500 -0.0500 -0.0214 0.0214 -0.0214 0.0357 -0.0500 @ http://127.0.0.1:8790/int4-gemm.html:140
+[  147618ms] [LOG] As[0..7]  -0.310 0.069 0.173 0.362 0.072 0.193 -0.414 0.434 @ http://127.0.0.1:8790/int4-gemm.html:140
+[  147618ms] [LOG] Bs[0..7]  -0.0357 0.0427 -0.0278 0.0139 0.0272 -0.0140 0.0274 -0.0285 @ http://127.0.0.1:8790/int4-gemm.html:140

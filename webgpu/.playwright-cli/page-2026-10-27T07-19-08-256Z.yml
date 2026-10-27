@@ -1,0 +1,18 @@
+- generic [active] [ref=f4e1]:
+  - heading "int4 GEMM · WebGPU" [level=1] [ref=f4e2]
+  - paragraph [ref=f4e3]: C[M,N] = A[M,K] · W[N,K]ᵀ，W 为 4 bit、每 32 个权重一个 scale、zero point 8。格式与 k2m 打包出的 int4.bin 逐字节一致。
+  - table [ref=f4e4]:
+    - rowgroup [ref=f4e5]:
+      - row [ref=f4e6]:
+        - columnheader "stage" [ref=f4e7]
+        - columnheader "result" [ref=f4e8]
+    - row [ref=f4e9]:
+      - cell "adapter" [ref=f4e10]
+      - cell "apple metal-3" [ref=f4e11]
+    - row [ref=f4e12]:
+      - cell "shader" [ref=f4e13]
+      - cell "compiled" [ref=f4e14]
+    - row [ref=f4e15]:
+      - cell "check 64×64×128" [ref=f4e16]
+      - cell "max|gpu-cpu| = 3.60e-1 (参考量级 0.4)" [ref=f4e17]
+  - generic [ref=f4e18]: "mismatch (idx, gpu, cpu): [[0,\"0.0000\",\"-0.0748\"],[1,\"0.0000\",\"-0.1484\"],[2,\"0.0000\",\"0.0157\"],[3,\"0.0000\",\"0.0472\"],[4,\"0.0000\",\"-0.0613\"],[5,\"0.0000\",\"0.0187\"]]"
