@@ -42,15 +42,19 @@ def entries(manifest):
     return out
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        print(__doc__)
-        return 2
-    src_bin = Path(sys.argv[1]).with_name("int4.bin")
-    manifest_path = Path(sys.argv[1]).with_name("manifest.json")
-    if not manifest_path.exists():
-        manifest_path = Path(sys.argv[1])
-    dst = Path(sys.argv[2])
+def main(manifest_path=None, dst=None) -> int:
+    """Callable two ways on purpose: the CLI takes a directory or a manifest,
+    and the Kaggle upload kernel imports this and passes both paths."""
+    if manifest_path is None:
+        if len(sys.argv) != 3:
+            print(__doc__)
+            return 2
+        manifest_path, dst = Path(sys.argv[1]), Path(sys.argv[2])
+    manifest_path = Path(manifest_path)
+    if manifest_path.is_dir():
+        manifest_path = manifest_path / "manifest.json"
+    src_bin = manifest_path.with_name("int4.bin")
+    dst = Path(dst)
 
     manifest = json.loads(manifest_path.read_text())
     blob = src_bin.read_bytes()
