@@ -32,6 +32,10 @@ TOKEN = "__TOKEN__"
 BIN_URL = "__BIN_URL__"
 MAN_URL = "__MAN_URL__"
 REPO = "flip-student-2step"
+# The token is fine-grained and scoped to the org, not to the person: it carries
+# repo.write for idefinity and nothing at all for zziang. Creating the repo
+# under the personal namespace answers 403, which is what the first run hit.
+ORG = "idefinity"
 PRIVATE = True
 SHA = "17aae6bf84f4e2dfcd3104cb048b19bc76553fa8"
 SRC = "idefinity/research-webml-flip"
@@ -169,11 +173,19 @@ try:
     # ---- 5. publish
     api = HfApi(token=TOKEN)
     who = api.whoami()
-    user = who.get("name")
-    p("hf user", user)
-    repo_id = f"{user}/{REPO}"
-    api.create_repo(repo_id, private=PRIVATE, exist_ok=True,
-                    repo_type="model")
+    p("hf user", who.get("name"), "| token scope",
+      json.dumps([s["entity"]["name"] for s in
+                  who.get("auth", {}).get("accessToken", {}).get("fineGrained", {}).get("scoped", [])]))
+    repo_id = f"{ORG}/{REPO}"
+    try:
+        api.create_repo(repo_id, private=PRIVATE, exist_ok=True, repo_type="model")
+    except Exception as e:
+        # an org without a paid plan cannot hold private repos; publishing is
+        # the point, so fall through loudly rather than stopping
+        p("private repo refused:", str(e)[:200])
+        PRIVATE = False
+        api.create_repo(repo_id, private=False, exist_ok=True, repo_type="model")
+        p("created PUBLIC - flip it from the repo settings if that is wrong")
     for name in ("model.safetensors", "README.md", "config.json",
                  "quantize.json", "manifest.json"):
         api.upload_file(path_or_fileobj=f"{W}/{name}", path_in_repo=name,
