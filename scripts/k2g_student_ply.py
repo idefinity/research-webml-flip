@@ -31,11 +31,16 @@ That identity is asserted against k2e/grid.json rather than trusted, because
 a mismatch here would silently evaluate a model on a schedule it never saw.
 
 Env:
-  FLIP_STUDENT   student checkpoint (default /kaggle/working/k2e/student_best.pt)
-  FLIP_IMAGE_DIR images to run; falls back to the repo's examples
-  FLIP_N         how many images (default 3)
-  FLIP_SEED      sampling seed - shared by all three runs so they start from
-                 the same noise, which is what makes them comparable
+  FLIP_STUDENT      student checkpoint (default /kaggle/working/k2e/student_best.pt)
+  FLIP_STUDENT_URL  fetch it over HTTP instead. This is the only way to get the
+                    weights out of the training kernel: a kernel's output is
+                    not the next kernel's input, and attaching a dataset is
+                    silently ignored. Kaggle's signed output URLs are readable
+                    without cookies, so paste one here.
+  FLIP_IMAGE_DIR    images to run; falls back to the repo's examples
+  FLIP_N            how many images (default 3)
+  FLIP_SEED         sampling seed - shared by all three runs so they start from
+                    the same noise, which is what makes them comparable
 """
 
 import json
@@ -86,6 +91,47 @@ RUNS = [
     {"tag": "s04", "label": "student 4 steps, no guidance",
      "steps": 4, "shift": 1.0, "guidance": 1.0, "student": True},
 ]
+
+
+def fetch_url(url, dst, min_bytes=1):
+    """Download to dst atomically, skipping if a complete file is there.
+
+    Re-running a kernel after a partial failure is normal here, and 741 MB is
+    not worth paying twice.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() and dst.stat().st_size >= min_bytes:
+        note(f"{dst.name} already on disk ({dst.stat().st_size/1e6:.1f} MB)")
+        return True
+    import urllib.request  # noqa: PLC0415
+    note(f"fetching {url[:64]}...")
+    t0 = time.time()
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=1800) as r:
+            with open(tmp, "wb") as fh:
+                while True:
+                    chunk = r.read(1 << 22)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+        os.replace(tmp, dst)
+    except Exception:  # noqa: BLE001
+        if tmp.exists():
+            tmp.unlink()
+        note(f"fetch FAILED: {traceback.format_exc()[-600:]}")
+        return False
+    note(f"  {dst.stat().st_size/1e6:.1f} MB in {time.time()-t0:.0f}s")
+    return True
+
+
+def fetch_student():
+    """Get the student weights, by URL if the file is not already on disk."""
+    url = os.environ.get("FLIP_STUDENT_URL", "").strip()
+    if not url:
+        return STUDENT
+    dst = STUDENT if STUDENT.suffix == ".pt" else WORK / "k2g/student.pt"
+    return dst if fetch_url(url, dst, int(1e6)) else None
 
 
 def pick_images():
@@ -143,6 +189,9 @@ def check_grid():
     quiet: the PLYs would still come out, just bad.
     """
     gj = WORK / "k2e/grid.json"
+    gurl = os.environ.get("FLIP_GRID_URL", "").strip()
+    if gurl and not gj.exists():
+        fetch_url(gurl, gj, 1)
     if not gj.exists():
         note("no k2e/grid.json - cannot check the schedule matches")
         return
@@ -176,11 +225,12 @@ def main():
     pipe = build_pipeline()
     teacher_sd = {k: v.detach().clone()
                   for k, v in pipe.flow_model.state_dict().items()}
+    student_path = fetch_student()
     student_sd = None
-    if STUDENT.exists():
-        blob = torch.load(str(STUDENT), map_location="cpu")
+    if student_path is not None and student_path.exists():
+        blob = torch.load(str(student_path), map_location="cpu")
         student_sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
-        note(f"loaded student: {len(student_sd)} tensors from {STUDENT.name}")
+        note(f"loaded student: {len(student_sd)} tensors from {student_path.name}")
     else:
         note("no student checkpoint - only the teacher runs will be produced")
 
