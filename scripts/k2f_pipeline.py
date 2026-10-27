@@ -15,11 +15,13 @@ Env (in addition to what k2d, k2e and k2g read):
   FLIP_SHA   commit to fetch the two scripts at
   FLIP_SKIP  "trace" | "train" - skip a stage, e.g. to re-train on old traces
   FLIP_PLY   1 = after training, render the PLYs in the same session
+  FLIP_INT4  1 = after that, pack the student into 4-bit blocks (k2m)
 
 FLIP_PLY exists because the student checkpoint is 1.48 GB and a kernel's output
 is not the next kernel's input: the only way back is a signed URL, which is
 single-use and runs at ~170 KB/s, and a re-run after any crash pays it again.
-Keeping the checkpoint in the session that made it costs nothing.
+Keeping the checkpoint in the session that made it costs nothing. FLIP_INT4 is
+the same argument one step further - quantizing needs the weights too.
 """
 
 import os
@@ -33,9 +35,10 @@ WORK = Path("/kaggle/working")
 FLIP_REPO = os.environ.get("FLIP_REPO", "idefinity/research-webml-flip")
 SHA = os.environ.get("FLIP_SHA", "HEAD")
 SCRIPTS = ["scripts/k2d_teacher_trace.py", "scripts/k2e_distill.py",
-           "scripts/k2g_student_ply.py"]
+           "scripts/k2g_student_ply.py", "scripts/k2m_int4_pack.py"]
 SKIP = os.environ.get("FLIP_SKIP", "").strip().lower()
 WITH_PLY = os.environ.get("FLIP_PLY", "0").strip() == "1"
+WITH_INT4 = os.environ.get("FLIP_INT4", "0").strip() == "1"
 
 
 def log(msg=""):
@@ -121,6 +124,18 @@ def main():
         log(f"plies: {len(plies)}")
         for p in plies:
             log(f"  {p.name}  {p.stat().st_size / 1e6:.2f} MB")
+
+    if WITH_INT4:
+        rc_m = stage(SCRIPTS[3], "int4")
+        if rc_m != 0:
+            log(f"int4 stage failed rc={rc_m}")
+        rc_e = rc_e or rc_m
+        b = WORK / "k2m/int4.bin"
+        m = WORK / "k2m/manifest.json"
+        log(f"int4.bin {b.stat().st_size / 1e6:.1f} MB" if b.exists()
+            else "int4.bin MISSING")
+        log(f"manifest  {m.stat().st_size / 1e3:.0f} kB" if m.exists()
+            else "manifest MISSING")
     return rc_d or rc_e
 
 

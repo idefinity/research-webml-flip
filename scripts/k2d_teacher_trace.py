@@ -504,7 +504,15 @@ def pick_images():
     cands = []
     if os.environ.get("FLIP_IMG_HF", "").strip():
         # a named dataset comes first; the four examples are only filler then
-        cands += fetch_hf(N_IMG)
+        hf = fetch_hf(N_IMG)
+        if not hf:
+            # Falling through to the examples here would train a two-hour run
+            # on four images while the log still says "fuliji": the one failure
+            # mode worth stopping for.
+            raise RuntimeError(
+                "FLIP_IMG_HF is set but datasets-server returned no rows - "
+                "refusing to fall back to the four examples")
+        cands += hf
     ex = REPO / "static" / "example_inputs"
     if ex.is_dir():
         cands += [p for p in sorted(ex.glob("*")) if p.suffix.lower() in IMG_EXT]
