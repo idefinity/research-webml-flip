@@ -7,11 +7,18 @@ they are rasterised, which is how K2b settled the 4-step question and how K2c
 found the pose drift.
 
 So: load the pipeline, swap the flow model for the student, run it, decode,
-save_ply, and put three PLYs next to each other -
+save_ply, and put the PLYs next to each other -
 
     teacher 20 steps / guidance 3     what we are trying to stay near
+    teacher  8 steps / guidance 3     where the error curve sits between
     teacher  4 steps / guidance 3     the naive shortcut, the K2b baseline
+    teacher  2 steps / guidance 3     the ceiling of any 2-step student
     student  4 steps / no guidance    what distillation bought
+
+The 2-step column is the reason this script can answer a strategy question as
+well as a quality one: the best a 2-step student can ever do is whatever the
+teacher does at 2 steps, so measuring that costs four forward calls and settles
+"is 2 steps worth chasing" before anyone spends three hours on it.
 
 The runtime schedule matters and is worth stating precisely. The sampler is
 
@@ -39,8 +46,8 @@ Env:
                     without cookies, so paste one here.
   FLIP_IMAGE_DIR    images to run; falls back to the repo's examples
   FLIP_N            how many images (default 3)
-  FLIP_SEED         sampling seed - shared by all three runs so they start from
-                    the same noise, which is what makes them comparable
+  FLIP_SEED         sampling seed - shared by every run so they all start
+                    from the same noise, which is what makes them comparable
 """
 
 import json
@@ -86,8 +93,15 @@ def save():
 RUNS = [
     {"tag": "t20", "label": "teacher 20 steps, guidance 3",
      "steps": 20, "shift": 3.0, "guidance": 3.0, "student": False},
+    {"tag": "t08", "label": "teacher 8 steps, guidance 3",
+     "steps": 8, "shift": 3.0, "guidance": 3.0, "student": False},
     {"tag": "t04", "label": "teacher 4 steps, guidance 3",
      "steps": 4, "shift": 3.0, "guidance": 3.0, "student": False},
+    # The 2-step teacher is the ceiling of any 2-step student, and it costs
+    # four forward calls to measure. Without it, "should we distill to 2 steps"
+    # is an argument; with it, it is a number that ends the argument either way.
+    {"tag": "t02", "label": "teacher 2 steps, guidance 3",
+     "steps": 2, "shift": 3.0, "guidance": 3.0, "student": False},
     {"tag": "s04", "label": "student 4 steps, no guidance",
      "steps": 4, "shift": 1.0, "guidance": 1.0, "student": True},
 ]
