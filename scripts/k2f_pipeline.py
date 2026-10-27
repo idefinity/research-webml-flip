@@ -11,9 +11,15 @@ The two stages run as subprocesses rather than being imported, because k2d
 forks one child per GPU and each child re-executes its own script file. If both
 stages lived in one process, every shard worker would start training.
 
-Env (in addition to what k2d and k2e read):
+Env (in addition to what k2d, k2e and k2g read):
   FLIP_SHA   commit to fetch the two scripts at
   FLIP_SKIP  "trace" | "train" - skip a stage, e.g. to re-train on old traces
+  FLIP_PLY   1 = after training, render the PLYs in the same session
+
+FLIP_PLY exists because the student checkpoint is 1.48 GB and a kernel's output
+is not the next kernel's input: the only way back is a signed URL, which is
+single-use and runs at ~170 KB/s, and a re-run after any crash pays it again.
+Keeping the checkpoint in the session that made it costs nothing.
 """
 
 import os
@@ -26,8 +32,10 @@ from pathlib import Path
 WORK = Path("/kaggle/working")
 FLIP_REPO = os.environ.get("FLIP_REPO", "idefinity/research-webml-flip")
 SHA = os.environ.get("FLIP_SHA", "HEAD")
-SCRIPTS = ["scripts/k2d_teacher_trace.py", "scripts/k2e_distill.py"]
+SCRIPTS = ["scripts/k2d_teacher_trace.py", "scripts/k2e_distill.py",
+           "scripts/k2g_student_ply.py"]
 SKIP = os.environ.get("FLIP_SKIP", "").strip().lower()
+WITH_PLY = os.environ.get("FLIP_PLY", "0").strip() == "1"
 
 
 def log(msg=""):
@@ -103,6 +111,16 @@ def main():
     grid = out / "grid.json"
     if grid.exists():
         log("grid " + grid.read_text().replace("\n", " "))
+
+    if WITH_PLY:
+        rc_g = stage(SCRIPTS[2], "ply")
+        if rc_g != 0:
+            log(f"ply stage failed rc={rc_g}")
+        rc_e = rc_e or rc_g
+        plies = sorted((WORK / "k2g").glob("*.ply"))
+        log(f"plies: {len(plies)}")
+        for p in plies:
+            log(f"  {p.name}  {p.stat().st_size / 1e6:.2f} MB")
     return rc_d or rc_e
 
 

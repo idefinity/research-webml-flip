@@ -12,13 +12,29 @@ save_ply, and put the PLYs next to each other -
     teacher 20 steps / guidance 3     what we are trying to stay near
     teacher  8 steps / guidance 3     where the error curve sits between
     teacher  4 steps / guidance 3     the naive shortcut, the K2b baseline
-    teacher  2 steps / guidance 3     the ceiling of any 2-step student
+    teacher  2 steps / guidance 3     what truncating the teacher's own field costs
     student  4 steps / no guidance    what distillation bought
 
-The 2-step column is the reason this script can answer a strategy question as
-well as a quality one: the best a 2-step student can ever do is whatever the
-teacher does at 2 steps, so measuring that costs four forward calls and settles
-"is 2 steps worth chasing" before anyone spends three hours on it.
+The teacher columns are controls, not ceilings. An earlier version of this note
+said the best a 2-step student can do is whatever the teacher does at 2 steps,
+and that is wrong: the student is a different field, trained to land on the
+teacher's 20-step endpoint, so it can beat the teacher at the same call count -
+and it does, on screen, at 4 steps.
+
+Two reasons the same-count comparison is not a bound. The student's per-call
+velocity is a chord (segment start to segment end), which by Taylor is the
+midpoint velocity plus O(dt^2); truncating the teacher uses the tangent at the
+segment start, which is O(dt). On a trajectory that bends, the gap is large -
+k2j measured it at 0.63-0.75 for the first segment. And the teacher columns run
+with guidance 3, so at large dt the 3a-2b combination pushes the state off the
+manifold on top of the integration error.
+
+What is a real bound: the teacher's 20-step endpoint (the target - the student
+cannot fix errors that are already in it), and the error of fitting that whole
+trajectory with n straight pieces, which grows like dt^2 * curvature. At 2 steps
+dt doubles and the first piece covers the most curved part of the path, so the
+floor rises about 4x. That makes 2 steps expensive, not impossible, and the
+teacher@2 column does not measure it because guidance is still on.
 
 The runtime schedule matters and is worth stating precisely. The sampler is
 
@@ -72,6 +88,13 @@ OUT.mkdir(parents=True, exist_ok=True)
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 STUDENT = Path(os.environ.get("FLIP_STUDENT", str(WORK / "k2e/student_best.pt")))
 N_IMG = int(os.environ.get("FLIP_N", "3"))
+# The student's call count. Must match what it was trained for, or check_grid
+# rejects the run before any PLY is written.
+S_STEPS = int(os.environ.get("FLIP_STEPS", "4"))
+# Which rows to render. A 20-step teacher costs 40 forward calls per image, so
+# re-rendering the whole table to add one student row is a waste; pass
+# FLIP_TAGS=t20,s02 when only those two matter.
+TAGS = [t.strip() for t in os.environ.get("FLIP_TAGS", "").split(",") if t.strip()]
 SEED = int(os.environ.get("FLIP_SEED", "42"))
 N_GAUSS = 65536
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
@@ -97,14 +120,15 @@ RUNS = [
      "steps": 8, "shift": 3.0, "guidance": 3.0, "student": False},
     {"tag": "t04", "label": "teacher 4 steps, guidance 3",
      "steps": 4, "shift": 3.0, "guidance": 3.0, "student": False},
-    # The 2-step teacher is the ceiling of any 2-step student, and it costs
-    # four forward calls to measure. Without it, "should we distill to 2 steps"
-    # is an argument; with it, it is a number that ends the argument either way.
+    # Truncating the teacher's own field. A control, not a ceiling - see the
+    # note at the top.
     {"tag": "t02", "label": "teacher 2 steps, guidance 3",
      "steps": 2, "shift": 3.0, "guidance": 3.0, "student": False},
-    {"tag": "s04", "label": "student 4 steps, no guidance",
-     "steps": 4, "shift": 1.0, "guidance": 1.0, "student": True},
+    {"tag": f"s{S_STEPS:02d}", "label": f"student {S_STEPS} steps, no guidance",
+     "steps": S_STEPS, "shift": 1.0, "guidance": 1.0, "student": True},
 ]
+if TAGS:
+    RUNS = [c for c in RUNS if c["tag"] in TAGS]
 
 
 def fetch_url(url, dst, min_bytes=1):
@@ -211,7 +235,7 @@ def check_grid():
         return
     g = json.loads(gj.read_text())
     import numpy as np
-    steps, shift = 4, 1.0
+    steps, shift = S_STEPS, 1.0
     u = np.linspace(1, 0, steps + 1)
     t_seq = shift * u / (1 + (shift - 1) * u)
     want_t = [round(x * 1000, 4) for x in t_seq[:-1]]
