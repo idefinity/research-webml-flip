@@ -248,11 +248,17 @@ def cos(a, b):
 
 def forward_velocity(model, state, t, cond):
     """Call the flow module the way the sampler does. t is passed through
-    untouched - the recorded value is already in the module's convention."""
+    untouched - the recorded value is already in the module's convention.
+
+    inference_mode is not optional. A dozen of these run per image, and each
+    one saves activations for backward; a rollout keeps four of those graphs
+    alive at once, which is how 14.35 GB disappeared on the first attempt.
+    """
     t_in = torch.as_tensor([t], device=DEV, dtype=torch.float32)
     sm = {k: v.to(DEV).float() for k, v in state.items()}
     cd = {k: v.to(DEV).float() for k, v in cond.items()}
-    with torch.autocast("cuda", torch.float16, cache_enabled=False):
+    with torch.inference_mode(), torch.autocast("cuda", torch.float16,
+                                                cache_enabled=False):
         out = model(sm, t_in, cd)
     return as_map(out)
 
@@ -286,9 +292,11 @@ def pair_calls(calls, t, k_index, all_states, dts, guidance):
     return best, which, best_err
 
 
-def analyse(pipe, flow, student, image_path, grid):
+def analyse(pipe, flow, student, image_path, grid, teacher_sd=None):
     note("-" * 72)
     note(Path(image_path).name)
+    if teacher_sd is not None:
+        flow.load_state_dict(teacher_sd)
     prepared = pipe.preprocess_image(Image.open(image_path).convert("RGB"))
     cond_full = pipe.encode_image(prepared)
 
@@ -353,6 +361,7 @@ def analyse(pipe, flow, student, image_path, grid):
                 if "teacher_inst_vs_segment" in m:
                     line += f"/tea {m['teacher_inst_vs_segment']['rel']:.3f}"
         note(line)
+    del v_stu, v_tea, v_star
 
     def rollout(velocities):
         x = {ch: all_states[g[0]][ch].float().clone().to(DEV)
@@ -370,6 +379,7 @@ def analyse(pipe, flow, student, image_path, grid):
     stu_vs = {ch: {"rel": rel(stu_roll[ch].cpu(), final[ch].float().cpu()),
                    "cos": cos(stu_roll[ch], final[ch])} for ch in stu_roll
               if ch in final}
+    del stu_roll
 
     tea_roll = rollout([pair_calls(rec.calls, ts[g[k]], g[k], all_states,
                                    dts, GUIDANCE)[0]
@@ -377,11 +387,12 @@ def analyse(pipe, flow, student, image_path, grid):
     tea_vs = {ch: {"rel": rel(tea_roll[ch].cpu(), final[ch].float().cpu()),
                    "cos": cos(tea_roll[ch], final[ch])} for ch in tea_roll
               if ch in final}
+    del tea_roll
 
-    note(f"  rollout to teacher endpoint (rel-l2):")
-    note(f"    teacher 4-step euler (baseline)  " +
+    note("  rollout to teacher endpoint (rel-l2):")
+    note("    teacher 4-step euler (baseline)  " +
          "  ".join(f"{ch} {m['rel']:.3f}" for ch, m in sorted(tea_vs.items())))
-    note(f"    student 4 steps                  " +
+    note("    student 4 steps                  " +
          "  ".join(f"{ch} {m['rel']:.3f}" for ch, m in sorted(stu_vs.items())))
 
     return {"image": Path(image_path).name, "grid_ok": True, "segments": segs,
@@ -414,29 +425,37 @@ def main():
 
     pipe = build_pipeline()
     flow = pipe.flow_model
-    student = None
+    teacher_sd = {k: v.detach().clone() for k, v in flow.state_dict().items()}
+    student_sd = None
     if student_path.exists():
         blob = torch.load(str(student_path), map_location="cpu")
-        sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
-        # load into the module as it stands (fp16 weights). Casting the module
-        # to fp32 here is what OOMed the first attempt: the teacher's 20-step
-        # CFG run then executes in fp32, doubling every activation, for no
-        # measurement benefit - the student forward runs under autocast anyway.
-        student = flow
-        student.load_state_dict(sd)
-        note(f"student loaded ({len(sd)} tensors, module dtype "
-             f"{next(student.parameters()).dtype})")
+        student_sd = (blob["model"] if isinstance(blob, dict)
+                      and "model" in blob else blob)
+        note(f"student on hand ({len(student_sd)} tensors)")
     else:
         note("NO STUDENT - only the teacher columns will mean anything")
 
+    # the module is ONE object wearing two hats. The trajectory has to come
+    # from the teacher's weights and the query from the student's, so the swap
+    # happens per image inside analyse(). Loading the student up front - as
+    # the first attempt did - makes the "teacher trajectory" the student's own
+    # rollout, and every number in the report describes the student talking
+    # to itself.
+    student = flow
+    if student_sd is not None:
+        flow.load_state_dict(student_sd)
+
     for img in pick_images():
         try:
-            R["images"].append(analyse(pipe, flow, student, img, grid))
+            R["images"].append(analyse(pipe, flow, student, img, grid,
+                                       teacher_sd=teacher_sd))
         except Exception:  # noqa: BLE001
             note("  image FAILED")
             note(traceback.format_exc()[-1200:])
             R["images"].append({"image": Path(img).name, "error":
                                 traceback.format_exc()[-800:]})
+        if student_sd is not None:
+            flow.load_state_dict(student_sd)
         save()
         torch.cuda.empty_cache()
 
