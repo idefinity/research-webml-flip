@@ -191,7 +191,11 @@ class Recorder:
                 rec.conds[key] = {
                     kk: v.detach().clone() for kk, v in as_map(condf).items()}
             call["cond_key"] = key
-            res = rec.orig(state, t, condf, *a, **k)
+            # orig is the plain class function, not a bound method: the
+            # instance has to go back in explicitly, or state lands in self's
+            # slot and cond goes missing. That is the TypeError this script's
+            # first run died on, in all four images at once.
+            res = rec.orig(_self, state, t, condf, *a, **k)
             call["out"] = {kk: v.detach().clone()
                            for kk, v in as_map(res).items()}
             rec.calls.append(call)
