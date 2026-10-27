@@ -1,6 +1,11 @@
 """Export the 2-step student DiT to ONNX, quantise its matmuls to 4 bits, and
 publish the graph next to the safetensors.
 
+Inputs are the raw encoder outputs: latent [B,8192,16], camera [B,1,5],
+feature1 [B,4101,1280] (DINOv3), feature2 [B,4096,128] (Flux2 VAE), t [B].
+The 5 zero tokens the encoder pads in front of the VAE features are inside the
+graph, so a caller hands over what the VAE actually produced.
+
 The safetensors repo is a weight file: to run it you need the architecture, the
 sampler constants and our packing convention. An ONNX graph is the other half -
 it carries the structure, and with MatMulNBits it carries the 4-bit weights too,
@@ -200,8 +205,16 @@ try:
             self.f = f
 
         def forward(self, latent, camera, feature1, feature2, t):
+            # The encoder pads 5 zero tokens in front of the VAE features so
+            # they line up with the DINO tokens (cls + 4 registers + patches).
+            # Upstream does this outside the model, which means the graph's
+            # caller would have to know to do it. Bake it in: feature2 is then
+            # the raw VAE output, which is what anyone actually has.
+            b = feature2.shape[0]
+            pad = torch.zeros(b, 5, feature2.shape[2],
+                              dtype=feature2.dtype, device=feature2.device)
             out = self.f({"latent": latent, "camera": camera}, t,
-                         {"feature1": feature1, "feature2": feature2})
+                         {"feature1": feature1, "feature2": torch.cat([pad, feature2], dim=1)})
             return out["latent"], out["camera"]
 
     wrap = Wrap(flow)
@@ -223,6 +236,7 @@ try:
     with torch.no_grad():
         outs = wrap(*dummy)
     p("  ok:", [tuple(o.shape) for o in outs], "in", round(time.time() - t0, 1), "s")
+    p("  cond token count: feature1", LC1, "+ pad 5 + feature2", LC2, "=", LC2 + 5)
 
     p("exporting (one traced forward at LQ=%d, this takes a minute) ..." % LQ)
     t0 = time.time()
