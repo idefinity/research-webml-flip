@@ -30,6 +30,38 @@
 
 ---
 
+## 二·零 已经做出来的东西
+
+`dit.int4.onnx` 已经在仓库里（294 MB，6265 节点）。导出脚本 `scripts/k2p_onnx_export.py`
+从 `k2e/student.pt`（1,482,301,473 字节）装进上游的 `LatentSeqMMFlowModel`，追踪一遍，
+再用 `MatMulNBitsQuantizer(bits=4, block_size=32, is_symmetric=True)` 量化。
+
+| | fp32 | int4 |
+|---|---|---|
+| 体积 | 1517 MB | **294 MB** |
+| 节点 | 6265 | 6265 |
+| 算子 | 259 MatMul + 3 Gemm | **203 `com.microsoft::MatMulNBits`** + 56 MatMul + 3 Gemm |
+
+**留下的 56 个 MatMul 全是注意力**：28 层（24 主 block + 2 noise refiner + 2 context refiner）
+各自的 QKᵀ 和 PV。它们没有权重，量化不到，也正是跑得最慢的那部分（406 对 1789）。
+
+静态形状，输入是编码器原始输出：
+`latent [1,8192,16]`、`camera [1,1,5]`、`feature1 [1,4101,1280]`、`feature2 [1,4096,128]`、`t [1]`。
+
+导出踩到的四个坑，都在脚本注释里：
+
+1. `aten::polar` 没有 ONNX symbolic，opset 17 也没有复数 → 卡在 `RePo3DRotaryEmbedding`，
+   还没碰到矩阵乘。改成实数版（乘 e^{iθ} 就是 2×2 旋转），与复数路径对拍 2.4e-7。
+2. 编码器给 VAE 特征补的 5 个零 token 在模型外面 → 烘进图里，输入契约变成「原始 VAE 输出」。
+3. 必须静态导出：`F.layer_norm(h, h.shape[-1:])` 在 dynamic_axes 下变成 Gather → ListConstruct，
+   导出器说 "not constant"。
+4. 不能按猜的长度预分配权重文件：torch 的 ckpt 是 zip，目录在末尾，错了就报 "corrupted"。
+
+**没做的验证**：这张图在 CPU 上没有端到端跑过（一次前向 5 分钟，内核撑不住）。
+int4 的证据是矩阵乘级别的（cosine 0.997、rel_l2 0.073）。
+
+---
+
 ## 二、ONNX 怎么用，哪里用不了
 
 ONNX Runtime 1.29 起，原生 WebGPU EP 带上了 **MatMulBnb4**（4 bit 权重）、PagedAttention、
