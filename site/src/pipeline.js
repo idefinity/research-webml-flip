@@ -7,14 +7,16 @@
 
 export const MODE = 'demo';
 
-// 分档字节数取自 k2m 打出来的 manifest 与 PLAN 的参数量表（DiT 按 g32 的 209 MB）。
+// 整条管线的体积预算（902 MB）——**不是**加载页读的东西。
+// 加载页只读 DiT 那一档：assets/k2n/int4.bin，209,276,416 字节，见 weights.js。
+// 其余几档还没打包，写在这里是为了别把"要装的东西"和"已经装了的东西"混成一张表。
 export const TIERS = [
-  { name: 'DINOv3 ViT-H/16+', mb: 433, note: '编码器，体积最大的一块' },
-  { name: 'Flux2 VAE 编码器', mb: 18, note: '进 latent' },
-  { name: 'DiT（学生，int4 g32）', mb: 209, note: '采样主干' },
-  { name: '八叉树解码器', mb: 26, note: '8 层采样' },
-  { name: '高斯解码器', mb: 122, note: '65K 高斯属性' },
-  { name: '抠图（浏览器侧替换）', mb: 114, note: '前景分离' },
+  { name: 'DINOv3 ViT-H/16+', mb: 433, note: '编码器，体积最大的一块', packed: false },
+  { name: 'Flux2 VAE 编码器', mb: 18, note: '进 latent', packed: false },
+  { name: 'DiT（学生，int4 g32）', mb: 209, note: '采样主干', packed: true },
+  { name: '八叉树解码器', mb: 26, note: '8 层采样', packed: false },
+  { name: '高斯解码器', mb: 122, note: '65K 高斯属性', packed: false },
+  { name: '抠图（浏览器侧替换）', mb: 114, note: '前景分离', packed: false },
 ];
 
 export const TOTAL_MB = TIERS.reduce((a, t) => a + t.mb, 0);

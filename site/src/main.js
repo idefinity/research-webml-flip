@@ -3,8 +3,9 @@ import { createLoader } from './loader.js';
 import { createThink } from './think.js';
 import { createViewer } from './viewer.js';
 import { loadPLY } from './ply.js';
+import { streamWeights, weightUrls, verifyLine, tensorAt } from './weights.js';
 import {
-  MODE, TOTAL_MB, SAMPLES, FALLBACK_PLY, runInference, tierAt,
+  MODE, SAMPLES, FALLBACK_PLY, runInference,
 } from './pipeline.js';
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +19,9 @@ const el = {
   bootFill: $('boot-fill'),
   bootBytes: $('boot-bytes'),
   bootPhase: $('boot-phase'),
+  bootTiers: $('boot-tiers'),
+  bootChecks: $('boot-checks'),
+  bootRate: $('boot-rate'),
   dropZone: $('drop'),
   samples: $('samples'),
   file: $('file'),
@@ -83,22 +87,102 @@ async function boot() {
   setStage('drop');
 }
 
-/** 分档加载。字节是真的（来自 manifest 与参数量表），耗时是演示的。 */
+/* --------------------------------------------------------------- 权重加载 */
+
+// 卡片扫完至少留这么久。本机读 200 MB 只要两三百毫秒，不设下限就只剩一眨。
+const BOOT_MIN_SWEEP = 1500;
+
+/** 桌面留下字节（下一步要喂给 GPU），手机只数不存。 */
+function canRetain() {
+  const mem = navigator.deviceMemory;
+  if (mem && mem < 8) return false;
+  return !matchMedia('(pointer: coarse)').matches;
+}
+
+/**
+ * 真的读 assets/k2n/int4.bin。显示的是字节，不是时间：
+ * 进度条走多快取决于盘和网络，走完了就是读完了。
+ */
 function loadWeights() {
-  const DUR = 4200;
+  const urls = weightUrls();
   const t0 = performance.now();
+  const st = { p: 0, read: 0, total: 0, tensor: '', rate: 0, stats: null };
+  let shown = 0;
+  let done = false;
+  let failed = false;
+  let ledger = null;
+  let failure = null;
+
+  const stream = streamWeights({
+    manifestUrl: urls.manifest,
+    binUrl: urls.bin,
+    retain: canRetain(),
+    onProgress(e) { Object.assign(st, e); },
+  }).then((r) => r, (e) => { failure = e; return null; });
+
   return new Promise((resolve) => {
+    function paint() {
+      // 真实进度是上限：显示的字节数永远不会超过已经读到的字节数。
+      // 本机读 200 MB 只要两百毫秒，所以再给一个最慢的扫过速度，否则动画一闪就没了。
+      const floorP = Math.min(1, (performance.now() - t0) / BOOT_MIN_SWEEP);
+      const real = failure ? 1 : st.p;
+      const target = Math.min(real, Math.max(shown, floorP));
+      shown += (target - shown) * 0.14;
+
+      if (loader) loader.setProgress(shown);
+      el.bootFill.style.width = `${(shown * 100).toFixed(1)}%`;
+
+      if (st.total) {
+        const mb = (shown >= 0.999 ? st.total : shown * st.total) / 1e6;
+        el.bootBytes.textContent = `${mb.toFixed(1)} MB / ${(st.total / 1e6).toFixed(1)} MB`;
+      } else {
+        el.bootBytes.textContent = '—';
+      }
+
+      // 扫到哪个张量就报哪个。读完了还要扫一小会儿，这时候按显示位置回报，
+      // 免得条子才过半就写"校验完成"。
+      let phase = st.tensor;
+      if (done && ledger && st.total) {
+        const seg = shown >= 0.999 ? null : tensorAt(ledger, shown * st.total);
+        phase = seg ? seg.name : (failed ? '权重不在本地' : '校验完成');
+      }
+      el.bootPhase.textContent = phase || '连接';
+      el.bootRate.textContent = st.rate > 0 ? `${st.rate.toFixed(0)} MB/s` : '—';
+    }
+
     function tick() {
-      const raw = Math.min(1, (performance.now() - t0) / DUR);
-      const p = 1 - Math.pow(1 - raw, 3);
-      if (loader) loader.setProgress(p);
-      el.bootFill.style.width = `${(p * 100).toFixed(1)}%`;
-      el.bootBytes.textContent = `${(p * TOTAL_MB).toFixed(1)} MB / ${TOTAL_MB} MB`;
-      el.bootPhase.textContent = tierAt(p).name;
-      if (raw < 1) requestAnimationFrame(tick);
-      else setTimeout(resolve, 260);
+      paint();
+      if (done && shown > 0.999) {
+        paint();
+        setTimeout(resolve, failure ? 900 : 620);
+        return;
+      }
+      requestAnimationFrame(tick);
     }
     requestAnimationFrame(tick);
+
+    stream.then((r) => {
+      if (!r) {
+        // 权重不在本地（发布时 200 MB 不进 git）—— 进度退化成占位，页面照样能走。
+        document.body.dataset.weights = 'missing';
+        el.bootTiers.textContent = '权重不在本地 · 占位进度';
+        el.bootChecks.textContent = '跳过校验';
+        console.warn('weight stream failed:', failure && failure.message);
+        failed = true;
+        done = true;
+        return;
+      }
+
+      const L = r.ledger;
+      ledger = L;
+      document.body.dataset.weights = r.clean && !r.short ? 'ok' : 'check';
+      el.bootTiers.textContent =
+        `DiT 学生 · ${L.int4.n} 张量化 + ${L.fp16.n} 张 fp16 · ${(L.int4.params / 1e6).toFixed(0)} M 参数`;
+      el.bootChecks.textContent = verifyLine(r);
+      el.bootPhase.textContent = r.short ? '读短了' : '校验完成';
+      window.__flipWeights = r;   // 调试：__.bytes 就是那 209 MB
+      done = true;
+    });
   });
 }
 

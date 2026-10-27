@@ -159,6 +159,23 @@ body[data-gpu="none"] .stage-boot::before {
 .boot-line .v { text-align: right; }
 .boot-line .v.num { color: var(--ink); }
 
+/* 张量名可能很长（context_repo_layers.8.content_map），让它在左边自己收尾。 */
+.boot-line .k.mono {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0;
+  color: var(--ink-2);
+  max-width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.boot-line.sub { font-size: 11px; }
+.boot-line.sub .k { letter-spacing: .04em; }
+
+.boot-line.done .k.mono { color: var(--good); }
+body[data-weights="check"] .boot-line.done .k.mono { color: var(--bad); }
+
 .boot-bar {
   height: 2px;
   background: var(--line);
@@ -412,6 +429,17 @@ body[data-stage="view"] .foot { display: none; }
   .view-hud { flex-direction: column; align-items: stretch; gap: 10px; bottom: 12px; }
   .view-right { margin-left: 0; justify-content: space-between; }
   .foot { display: none; }
+}
+
+/* 窄屏下这几行都很长：权重名、字节数、抽样统计都得压住不换行，
+   否则一个"权"字占一行，面板立刻散架。 */
+@media (max-width: 520px) {
+  .boot-readout { width: min(520px, 88vw); padding: 18px 16px; gap: 12px; }
+  .boot-line { font-size: 11px; gap: 10px; }
+  .boot-line .k { flex: none; white-space: nowrap; }
+  .boot-line .k.mono { max-width: 42%; }
+  .boot-line .v.num { white-space: nowrap; }
+  .boot-line .v { text-align: right; }
 }
 
 @media (prefers-reduced-motion: reduce) {
