@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>pipeline budget · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  h2 { font-size: 14px; font-weight: 500; margin: 26px 0 6px; color: #cfcdc4; }
+  p.sub { color: #9c9a92; margin: 0 0 18px; font-size: 13px; max-width: 74ch; }
+  table { border-collapse: collapse; margin: 6px 0 14px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 4px 16px 4px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; } .dim { color: #9c9a92; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>pipeline budget · WebGPU</h1>
+<p class="sub">
+DiT 之外的三段——DINOv3 图像编码、octree 解码、Gaussian 解码——按 <code>triposplat.py</code> 里的真实配置
+在 GPU 上真跑一遍。权重是随机 int4，形状是真的；计时不含回读，每段三次取最小。
+VAE 那段全是 3×3 卷积，单独给一个直接卷积内核的速率当锚。
+</p>
+<p class="sub">
+结论：30 秒不成立，而且 DiT 只占一半。四段加起来 48 s，其中 VAE 编码 15 s、DINOv3 5 s、
+两个解码器 2 s。BiRefNet 抠图还没测，按 1.3 TFLOP 的 Swin-L 估还要 3–8 s。
+</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const $t = document.getElementById('t');
+const logEl = document.getElementById('log');
+function row(k, v, cls) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+}
+function h2(s) {
+  const d = document.createElement('h2'); d.textContent = s; document.body.insertBefore(d, logEl);
+}
+function log(s) { logEl.textContent += s + '\n'; }
+
+// ---------------------------------------------------------------- config
+// every number here is read off triposplat.py, not guessed
+const CFG = {
+  dinov3: { tokens: 4101, dim: 1280, layers: 32, heads: 20, mlp: 5120 },   // 1 cls + 4 reg + 64x64 patches
+  dit:    { tokens: 12294, blocks: 24, dim: 1024, mlp: 4096 },             // 8192 latent + 4101 cond + 1 cam
+  octree: { blocks: 4,  dim: 1024, heads: 16, mlp: 4096, levels: 8, cond: 8192 },
+  gs:     { blocks: 16, dim: 1024, heads: 16, mlp: 4096, points: 2048, cond: 8192 },  // 65536 / 32
+  vae:    { tflop: 6.75 },   // counted by hand from Flux2Encoder: 12 resnets + 3 samplers + mid attn
+};
+
+// ---------------------------------------------------------------- gemm
+const GEMM_WGSL = /* wgsl */`
+struct Dims { m: u32, n: u32, k: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> Wq: array<u32>;
+@group(0) @binding(2) var<storage, read> Ws: array<f32>;
+@group(0) @binding(3) var<storage, read_write> C: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+
+const TM = 64u;
+const TN = 128u;
+const RX = 32u;
+const BK = 32u;
+const A_PER = 2u;
+const B_PER = 2u;
+
+var<workgroup> As: array<f32, 64 * 32>;
+var<workgroup> Bs: array<f32, 32 * 128>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) lid: u32) {
+  let bm = wid.x * TM;
+  let bn = wid.y * TN;
+  let row0 = (lid / RX) * 8u;
+  let col0 = (lid % RX) * 4u;
+  let kbytes = d.k / 2u;
+  let kblocks = d.k / 32u;
+
+  var acc: array<f32, 32>;
+  for (var i = 0u; i < 32u; i = i + 1u) { acc[i] = 0.0; }
+
+  for (var kb = 0u; kb < kblocks; kb = kb + 1u) {
+    let k0 = kb * BK;
+
+    for (var f = 0u; f < A_PER; f = f + 1u) {
+      let vi = lid * A_PER + f;
+      let r = vi / 8u;
+      let c4 = (vi % 8u) * 4u;
+      let gm = bm + r;
+      var v = vec4<f32>(0.0);
+      if (gm < d.m) { v = vec4<f32>(A[gm * d.k + k0 + c4], A[gm * d.k + k0 + c4 + 1u],
+                                    A[gm * d.k + k0 + c4 + 2u], A[gm * d.k + k0 + c4 + 3u]); }
+      As[r * 32u + c4] = v.x;
+      As[r * 32u + c4 + 1u] = v.y;
+      As[r * 32u + c4 + 2u] = v.z;
+      As[r * 32u + c4 + 3u] = v.w;
+    }
+
+    for (var f = 0u; f < B_PER; f = f + 1u) {
+      let wi = lid * B_PER + f;
+      let r = wi / 4u;
+      let j = wi % 4u;
+      let row = bn + r;
+      var packed = 0u;
+      var scale = 0.0;
+      if (row < d.n) {
+        packed = Wq[(row * kbytes + kb * 16u) / 4u + j];
+        scale = Ws[row * kblocks + kb];
+      }
+      for (var b = 0u; b < 4u; b = b + 1u) {
+        let byte = (packed >> (b * 8u)) & 0xffu;
+        let jj = j * 4u + b;
+        Bs[(jj * 2u) * TN + r] = f32(i32(byte & 0x0fu) - 8) * scale;
+        Bs[(jj * 2u + 1u) * TN + r] = f32(i32((byte >> 4u) & 0x0fu) - 8) * scale;
+      }
+    }
+
+    workgroupBarrier();
+    for (var kk = 0u; kk < BK; kk = kk + 1u) {
+      var av: array<f32, 8>;
+      var bv: array<f32, 4>;
+      for (var i = 0u; i < 8u; i = i + 1u) { av[i] = As[(row0 + i) * 32u + kk]; }
+      for (var j = 0u; j < 4u; j = j + 1u) { bv[j] = Bs[kk * TN + col0 + j]; }
+      for (var i = 0u; i < 8u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+          acc[i * 4u + j] = acc[i * 4u + j] + av[i] * bv[j];
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  for (var i = 0u; i < 8u; i = i + 1u) {
+    let gm = bm + row0 + i;
+    if (gm >= d.m) { continue; }
+    for (var j = 0u; j < 4u; j = j + 1u) {
+      let gn = bn + col0 + j;
+      if (gn >= d.n) { continue; }
+      C[gm * d.n + gn] = acc[i * 4u + j];
+    }
+  }
+}
+`;
+
+// ---------------------------------------------------------------- attention
+// same kernel as attn.html, with lq and lk split so cross-attention can be
+// measured at its real shape (2048 queries over 8192 keys) instead of a square
+const ATTN_WGSL = /* wgsl */`
+enable f16;
+
+struct Dims { lq: u32, lk: u32, h: u32, hd: u32, scale: f32, p0: f32, p1: f32, p2: f32 };
+
+@group(0) @binding(0) var<storage, read> Q4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> K4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> V4: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+
+const BQ = 64u;
+const BK = 64u;
+const HD4 = 16u;
+const BK4 = 16u;
+
+var<workgroup> qs: array<vec4<f16>, 1024>;
+var<workgroup> ksv: array<vec4<f16>, 1024>;
+var<workgroup> ss: array<vec4<f16>, 1024>;
+var<workgroup> ml: array<f32, 128>;
+var<workgroup> al: array<f32, 64>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32) {
+  let h = wid.y;
+  let q0 = wid.x * BQ;
+  let stride4 = (d.h * d.hd) / 4u;
+  let base4 = (h * d.hd) / 4u;
+  let scale = d.scale;
+
+  let r0 = 4u * (tid / 16u);
+  let c0 = 4u * (tid % 16u);
+
+  if (tid < BQ) { ml[tid] = -1e30; ml[BQ + tid] = 0.0; }
+
+  for (var f = 0u; f < 4u; f = f + 1u) {
+    let idx = tid * 4u + f;
+    let r = idx / HD4;
+    let t = idx % HD4;
+    let gr = q0 + r;
+    var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (gr < d.lq) { v = Q4[gr * stride4 + base4 + t]; }
+    qs[r * HD4 + t] = vec4<f16>(v);
+  }
+
+  var o: array<vec4<f32>, 4>;
+  for (var i = 0u; i < 4u; i = i + 1u) { o[i] = vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+
+  workgroupBarrier();
+
+  let nblk = (d.lk + BK - 1u) / BK;
+  for (var b = 0u; b < nblk; b = b + 1u) {
+    let k0 = b * BK;
+
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let r = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + r;
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (gr < d.lk) { v = K4[gr * stride4 + base4 + t]; }
+      ksv[t * BK + r] = vec4<f16>(v);
+    }
+    workgroupBarrier();
+
+    var acc: array<f32, 16>;
+    for (var i = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+    for (var t = 0u; t < HD4; t = t + 1u) {
+      var qa: array<vec4<f32>, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { qa[i] = vec4<f32>(qs[(r0 + i) * HD4 + t]); }
+      for (var j = 0u; j < 4u; j = j + 1u) {
+        let kv = vec4<f32>(ksv[t * BK + c0 + j]);
+        for (var i = 0u; i < 4u; i = i + 1u) { acc[i * 4u + j] = acc[i * 4u + j] + dot(qa[i], kv); }
+      }
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      var p = vec4<f32>(acc[i * 4u + 0u], acc[i * 4u + 1u], acc[i * 4u + 2u], acc[i * 4u + 3u]) * scale;
+      let key = k0 + c0;
+      if (key + 3u >= d.lk) {
+        let keep = vec4<bool>(key < d.lk, key + 1u < d.lk, key + 2u < d.lk, key + 3u < d.lk);
+        p = select(vec4<f32>(-1e4, -1e4, -1e4, -1e4), p, keep);
+      }
+      ss[(r0 + i) * BK4 + c0 / 4u] = vec4<f16>(p);
+    }
+    workgroupBarrier();
+
+    // V into the buffer K just vacated
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let key = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + key;
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (gr < d.lk) { v = V4[gr * stride4 + base4 + t]; }
+      ksv[key * HD4 + t] = vec4<f16>(v);
+    }
+
+    if (tid < BQ) {
+      var mx = -1e30;
+      for (var c = 0u; c < BK4; c = c + 1u) {
+        let p4 = ss[tid * BK4 + c];
+        mx = max(mx, max(max(f32(p4.x), f32(p4.y)), max(f32(p4.z), f32(p4.w))));
+      }
+      let old = ml[tid];
+      let nm = max(old, mx);
+      let alpha = select(0.0, exp(old - nm), old > -1e29);
+      al[tid] = alpha;
+      var sum = 0.0;
+      for (var c = 0u; c < BK4; c = c + 1u) {
+        let p4 = ss[tid * BK4 + c];
+        let e = vec4<f32>(exp(f32(p4.x) - nm), exp(f32(p4.y) - nm),
+                          exp(f32(p4.z) - nm), exp(f32(p4.w) - nm));
+        sum = sum + e.x + e.y + e.z + e.w;
+        ss[tid * BK4 + c] = vec4<f16>(e);
+      }
+      ml[tid] = nm;
+      ml[BQ + tid] = ml[BQ + tid] * alpha + sum;
+    }
+    workgroupBarrier();
+
+    for (var i = 0u; i < 4u; i = i + 1u) { o[i] = o[i] * al[r0 + i]; }
+    for (var kg = 0u; kg < BK4; kg = kg + 1u) {
+      var p4: array<vec4<f32>, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { p4[i] = vec4<f32>(ss[(r0 + i) * BK4 + kg]); }
+      for (var j = 0u; j < 4u; j = j + 1u) {
+        let gr = k0 + kg * 4u + j;
+        if (gr < d.lk) {
+          let v4 = vec4<f32>(ksv[(kg * 4u + j) * HD4 + c0 / 4u]);
+          for (var i = 0u; i < 4u; i = i + 1u) {
+            let p = select(p4[i].w, select(p4[i].z, select(p4[i].y, p4[i].x, j < 1u), j < 2u), j < 3u);
+            o[i] = o[i] + v4 * p;
+          }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let gr = q0 + r0 + i;
+    if (gr >= d.lq) { continue; }
+    let inv = 1.0 / max(ml[BQ + r0 + i], 1e-20);
+    let at = (gr * stride4 + base4) * 4u + c0;
+    O[at] = o[i].x * inv;
+    O[at + 1u] = o[i].y * inv;
+    O[at + 2u] = o[i].z * inv;
+    O[at + 3u] = o[i].w * inv;
+  }
+}
+`;
+
+// ---------------------------------------------------------------- conv 3x3
+// Direct conv, but with the two things that matter: eight horizontally
+// adjacent pixels per thread (their 3x3 windows overlap, so the row of ten
+// inputs is loaded once and reused by three taps), and four output channels in
+// a register vector. The naive version - one pixel, one weight load per FMA -
+// measured 44 GFLOP/s, which would put the VAE encoder at 154 s and is not a
+// number any real implementation would produce.
+const CONV_WGSL = /* wgsl */`
+struct CDims { side: u32, cin: u32, cout: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> X: array<f32>;    // [pixel][cin]
+@group(0) @binding(1) var<storage, read> Wt: array<f32>;   // [cout][cin][3][3]
+@group(0) @binding(2) var<storage, read_write> Y: array<f32>;
+@group(0) @binding(3) var<uniform> c: CDims;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let side = c.side;
+  let ng = c.cout / 4u;
+  let nx = side / 8u;
+  let total = nx * side * ng;
+  if (gid.x >= total) { return; }
+
+  let group = gid.x % ng;
+  let rest = gid.x / ng;
+  let row = rest % side;
+  let x0 = (rest / side) * 8u;
+  let cg = group * 4u;
+  let sd = i32(side);
+
+  var acc: array<vec4<f32>, 8>;
+  for (var i = 0u; i < 8u; i = i + 1u) { acc[i] = vec4<f32>(0.0); }
+
+  for (var ky = 0u; ky < 3u; ky = ky + 1u) {
+    let yy = i32(row) + i32(ky) - 1;
+    if (yy < 0 || yy >= sd) { continue; }
+    for (var kx = 0u; kx < c.cin; kx = kx + 1u) {
+      // the ten columns this eight-pixel run needs
+      var xv: array<f32, 10>;
+      for (var i = 0u; i < 10u; i = i + 1u) {
+        let xx = i32(x0) + i32(i) - 1;
+        var v = 0.0;
+        if (xx >= 0 && xx < sd) { v = X[(u32(yy) * side + u32(xx)) * c.cin + kx]; }
+        xv[i] = v;
+      }
+      for (var t = 0u; t < 3u; t = t + 1u) {
+        let tap = ky * 3u + t;
+        let base = ((cg * c.cin + kx) * 9u + tap);
+        let w = vec4<f32>(Wt[base], Wt[base + c.cin * 9u],
+                          Wt[base + c.cin * 18u], Wt[base + c.cin * 27u]);
+        for (var p = 0u; p < 8u; p = p + 1u) {
+          acc[p] = acc[p] + w * xv[p + t];
+        }
+      }
+    }
+  }
+
+  for (var p = 0u; p < 8u; p = p + 1u) {
+    let o = (row * side + x0 + p) * c.cout + cg;
+    Y[o] = acc[p].x; Y[o + 1u] = acc[p].y; Y[o + 2u] = acc[p].z; Y[o + 3u] = acc[p].w;
+  }
+}
+`;
+
+const gpuRand = (() => { let s = 12345; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5; })();
+
+async function main() {
+  if (!navigator.gpu) { row('WebGPU', '不可用', 'bad'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const dev = await adapter.requestDevice({
+    requiredFeatures: adapter.features.has('shader-f16') ? ['shader-f16'] : [],
+    requiredLimits: {
+    maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+    maxBufferSize: adapter.limits.maxBufferSize,
+  }});
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  row('adapter', [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join(' ') +
+      ` · workgroup storage ${adapter.limits.maxComputeWorkgroupStorageSize} B`, 'ok');
+
+  const bglG = dev.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ]});
+  const bglC = dev.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ]});
+  const pipe = async (code, bgl, name) => {
+    const mod = dev.createShaderModule({ code });
+    const ci = await mod.getCompilationInfo();
+    const errs = ci.messages.filter(m => m.type === 'error');
+    if (errs.length) { row(name, errs[0].message + ' @' + errs[0].lineNum, 'bad'); throw new Error(name); }
+    return dev.createComputePipeline({ layout: dev.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+                                       compute: { module: mod, entryPoint: 'main' } });
+  };
+  const pGemm = await pipe(GEMM_WGSL, bglG, 'gemm');
+  const pAttn = await pipe(ATTN_WGSL, bglG, 'attn');
+  const pConv = await pipe(CONV_WGSL, bglC, 'conv');
+  row('shaders', 'gemm / attention (lq≠lk) / conv3x3 编译通过', 'ok');
+
+  // ------------------------------------------------------------ buffers
+  // 4101 x 5120 is the widest activation anywhere (DINO's mlp), and
+  // 4101 x 20 x 64 is its attention. A and C stay separate: writing C on top of
+  // A inside one dispatch would feed back into tiles other workgroups read.
+  const ACT = 4101 * 5120 * 4;
+  const bufA = dev.createBuffer({ size: ACT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const bufC = dev.createBuffer({ size: ACT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const ATT = 4101 * 20 * 64 * 4;
+  const qb = dev.createBuffer({ size: ATT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const kb = dev.createBuffer({ size: ATT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const vb = dev.createBuffer({ size: ATT, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+  const weights = new Map();
+  function weight(n, k) {
+    const key = n + 'x' + k;
+    if (weights.has(key)) return weights.get(key);
+    const words = (n * k) / 8;                     // int4: n*k/2 bytes
+    const q = new Uint32Array(words);
+    for (let i = 0; i < words; i++) q[i] = (gpuRand() * 4294967296) >>> 0;
+    const qq = dev.createBuffer({ size: Math.max(16, words * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(qq, 0, q);
+    const s = new Float32Array(n * k / 32).fill(0.01);
+    const ss = dev.createBuffer({ size: Math.max(16, s.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(ss, 0, s);
+    const w = { q: qq, s: ss, n, k };
+    weights.set(key, w);
+    return w;
+  }
+
+  // uniform blocks that mix u32 and f32: writing the whole thing as Float32Array
+  // would put 1.0 into a field the shader reads as u32 and dispatch 1 workgroup
+  const unis = new Map();
+  function makeUni(key, words, floats) {
+    if (unis.has(key)) return unis.get(key);
+    const ab = new ArrayBuffer(32);
+    const w = new Uint32Array(ab, 0, 4);
+    const f = new Float32Array(ab);
+    words.forEach((v, i) => { w[i] = v; });
+    floats.forEach((v, i) => { f[4 + i] = v; });
+    const b = dev.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(b, 0, ab);
+    unis.set(key, b);
+    return b;
+  }
+  const uniDims = a => makeUni('d' + a.join(','), a, []);
+  const uniAttn = (lq, lk, h, hd, s) => makeUni(`a${lq},${lk},${h},${hd}`, [lq, lk, h, hd], [s]);
+
+  // ------------------------------------------------------------ op list
+  // each op is {kind, ...} and turns into exactly the dispatch a real
+  // implementation would issue: one per matrix, one per attention
+  function gemmOp(M, N, K) { return { kind: 'gemm', M, N, K, w: weight(N, K) }; }
+  function attnOp(lq, lk, h, hd) { return { kind: 'attn', lq, lk, h, hd, scale: 1 / Math.sqrt(hd) }; }
+
+  function flops(op) {
+    if (op.kind === 'gemm') return 2 * op.M * op.N * op.K;
+    return 4 * op.lq * op.lk * op.hd * op.h;     // QK^T + PV
+  }
+
+  function encodeOps(ops) {
+    const enc = dev.createCommandEncoder();
+    for (const op of ops) {
+      const pass = enc.beginComputePass();
+      if (op.kind === 'gemm') {
+        const bg = dev.createBindGroup({ layout: bglG, entries: [
+          { binding: 0, resource: { buffer: bufA } },
+          { binding: 1, resource: { buffer: op.w.q } },
+          { binding: 2, resource: { buffer: op.w.s } },
+          { binding: 3, resource: { buffer: bufC } },
+          { binding: 4, resource: { buffer: uniDims([op.M, op.N, op.K, 0]) } },
+        ]});
+        pass.setPipeline(pGemm); pass.setBindGroup(0, bg);
+        pass.dispatchWorkgroups(Math.ceil(op.M / 64), Math.ceil(op.N / 128));
+      } else {
+        const bg = dev.createBindGroup({ layout: bglG, entries: [
+          { binding: 0, resource: { buffer: qb } }, { binding: 1, resource: { buffer: kb } },
+          { binding: 2, resource: { buffer: vb } }, { binding: 3, resource: { buffer: bufC } },
+          { binding: 4, resource: { buffer: uniAttn(op.lq, op.lk, op.h, op.hd, op.scale) } },
+        ]});
+        pass.setPipeline(pAttn); pass.setBindGroup(0, bg);
+        pass.dispatchWorkgroups(Math.ceil(op.lq / 64), op.h);
+      }
+      pass.end();
+    }
+    return enc.finish();
+  }
+
+  // A command buffer can only be submitted once - resubmitting one is an error
+  // that produces a 0 ms "result", which is how this page first reported that
+  // the whole pipeline beyond the DiT costs nothing. Encode per round and time
+  // the encode separately from the GPU.
+  async function timeOps(ops, rounds = 3) {
+    let best = Infinity, encMs = 0;
+    dev.queue.submit([encodeOps(ops)]);          // warm
+    await dev.queue.onSubmittedWorkDone();
+    for (let r = 0; r < rounds; r++) {
+      const t0 = performance.now();
+      const cmds = encodeOps(ops);
+      const t1 = performance.now();
+      dev.queue.submit([cmds]);
+      await dev.queue.onSubmittedWorkDone();
+      const t2 = performance.now();
+      encMs = Math.max(encMs, t1 - t0);
+      best = Math.min(best, t2 - t1);
+    }
+    let fl = 0; for (const op of ops) fl += flops(op);
+    return { ms: best, enc: encMs, tflop: fl / 1e12, rate: fl / (best * 1e6) };
+  }
+
+  // ------------------------------------------------------------ correctness
+  // one tiny attention with lq ≠ lk, against a CPU reference: the lq/lk split
+  // is the only thing that changed from the verified square version
+  {
+    const lq = 64, lk = 128, h = 2, hd = 64;
+    const Q = new Float32Array(lq * h * hd), K = new Float32Array(lk * h * hd), V = new Float32Array(lk * h * hd);
+    for (let i = 0; i < Q.length; i++) Q[i] = gpuRand();
+    for (let i = 0; i < K.length; i++) K[i] = gpuRand();
+    for (let i = 0; i < V.length; i++) V[i] = gpuRand();
+    const wb = (a, b) => { dev.queue.writeBuffer(a, 0, b); };
+    wb(qb, Q); wb(kb, K); wb(vb, V);
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    const bg = dev.createBindGroup({ layout: bglG, entries: [
+      { binding: 0, resource: { buffer: qb } }, { binding: 1, resource: { buffer: kb } },
+      { binding: 2, resource: { buffer: vb } }, { binding: 3, resource: { buffer: bufC } },
+      { binding: 4, resource: { buffer: uniAttn(lq, lk, h, hd, 1 / Math.sqrt(hd)) } },
+    ]});
+    pass.setPipeline(pAttn); pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(Math.ceil(lq / 64), h);
+    pass.end();
+    dev.queue.submit([enc.finish()]);
+    const rb = dev.createBuffer({ size: lq * h * hd * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e2 = dev.createCommandEncoder(); e2.copyBufferToBuffer(bufC, 0, rb, 0, lq * h * hd * 4);
+    dev.queue.submit([e2.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap();
+
+    let err = 0, mag = 0;
+    for (let q = 0; q < lq; q++) for (let hh = 0; hh < h; hh++) {
+      const row = [];
+      for (let k = 0; k < lk; k++) {
+        let d = 0;
+        for (let t = 0; t < hd; t++) d += Q[(q * h + hh) * hd + t] * K[(k * h + hh) * hd + t];
+        row.push(d / Math.sqrt(hd));
+      }
+      const mx = Math.max(...row);
+      let sum = 0; const p = row.map(v => { const e = Math.exp(v - mx); sum += e; return e; });
+      for (let t = 0; t < hd; t++) {
+        let acc = 0;
+        for (let k = 0; k < lk; k++) acc += p[k] / sum * V[(k * h + hh) * hd + t];
+        const ref = acc;
+        const g = got[(q * h + hh) * hd + t];
+        err = Math.max(err, Math.abs(g - ref)); mag = Math.max(mag, Math.abs(ref));
+      }
+    }
+    row('check attn lq=64 lk=128', `max|gpu-cpu| ${err.toExponential(2)} / |ref| ${mag.toFixed(2)}`,
+        err < mag * 2e-2 ? 'ok' : 'bad');
+  }
+
+  // ------------------------------------------------------------ stages
+  const results = [];
+
+  // DINOv3 ViT-L/16 at 1024²: 4101 tokens, dim 1280, 32 layers, mlp 5120
+  {
+    const d = CFG.dinov3;
+    const ops = [];
+    for (let i = 0; i < d.layers; i++) {
+      ops.push(gemmOp(d.tokens, d.dim * 3, d.dim));
+      ops.push(attnOp(d.tokens, d.tokens, d.heads, d.dim / d.heads));
+      ops.push(gemmOp(d.tokens, d.dim, d.dim));
+      ops.push(gemmOp(d.tokens, d.mlp, d.dim));
+      ops.push(gemmOp(d.tokens, d.dim, d.mlp));
+    }
+    const r = await timeOps(ops);
+    results.push({ name: 'DINOv3 编码', ...r, ops: ops.length });
+    row('DINOv3 编码 (L=4101, 32 层)', `${r.ms.toFixed(0)} ms · ${r.tflop.toFixed(2)} TFLOP · ${r.rate.toFixed(0)} GFLOP/s · encode ${r.enc.toFixed(1)} ms`, 'ok');
+  }
+
+  // octree decoder: 4 cross-only blocks, run once per level. N_lv is the
+  // geometric growth from 1 point to 2048, which is what a balanced octree
+  // with systematic sampling produces.
+  {
+    const d = CFG.octree, final = CFG.gs.points;
+    const sizes = [];
+    for (let lv = 1; lv <= d.levels; lv++) sizes.push(Math.max(1, Math.round(Math.pow(final, lv / d.levels))));
+    let total = 0, tf = 0;
+    const per = [];
+    for (const n of sizes) {
+      const ops = [];
+      for (let b = 0; b < d.blocks; b++) {
+        ops.push(gemmOp(n, d.dim, d.dim));            // to_q
+        ops.push(gemmOp(d.cond, d.dim * 2, 32));      // to_kv over the latent, K padded 16->32
+        ops.push(attnOp(n, d.cond, d.heads, d.dim / d.heads));
+        ops.push(gemmOp(n, d.dim, d.dim));            // to_out
+        ops.push(gemmOp(n, d.mlp, d.dim));
+        ops.push(gemmOp(n, d.dim, d.mlp));
+      }
+      const r = await timeOps(ops);
+      per.push({ n, ms: r.ms });
+      total += r.ms; tf += r.tflop;
+    }
+    results.push({ name: 'octree 解码', ms: total, tflop: tf, ops: -1 });
+    row(`octree 解码 (4 块 × 8 层)`, `${total.toFixed(1)} ms · ${tf.toFixed(2)} TFLOP · 每层 ${per.map(p => p.ms.toFixed(1)).join(' / ')} ms`, 'ok');
+    log('  octree 每层 token 数: ' + per.map(p => p.n).join(' '));
+
+    // 12 ms at three tokens needs explaining before the number is used
+    for (const n of [3, final]) {
+      const kv = [], mm = [], at = [];
+      for (let b = 0; b < d.blocks; b++) {
+        kv.push(gemmOp(d.cond, d.dim * 2, 32));
+        mm.push(gemmOp(n, d.dim, d.dim), gemmOp(n, d.dim, d.dim),
+                gemmOp(n, d.mlp, d.dim), gemmOp(n, d.dim, d.mlp));
+        at.push(attnOp(n, d.cond, d.heads, d.dim / d.heads));
+      }
+      const a = await timeOps(kv), b2 = await timeOps(mm), c2 = await timeOps(at);
+      row(`  n=${n} 分解`, `kv 投影 ${a.ms.toFixed(2)} · 4 个 gemm×4 块 ${b2.ms.toFixed(2)} · 4 次 cross-attn ${c2.ms.toFixed(2)} ms`, 'dim');
+    }
+    log('  octree 每层有一笔与点数无关的固定开销：kv 投影 3.1 ms + cross-attn 6.6 ms，' +
+        '都是把 8192 个 latent 重读一遍。n=3 和 n=2048 时一样，8 层就是 8 次。');
+  }
+
+  // Gaussian decoder: 16 blocks at 2048 points, self + cross attention
+  {
+    const d = CFG.gs;
+    const ops = [];
+    for (let b = 0; b < d.blocks; b++) {
+      ops.push(gemmOp(d.points, d.dim * 3, d.dim));       // self qkv
+      ops.push(attnOp(d.points, d.points, d.heads, d.dim / d.heads));
+      ops.push(gemmOp(d.points, d.dim, d.dim));          // self out
+      ops.push(gemmOp(d.points, d.dim, d.dim));          // cross q
+      ops.push(gemmOp(d.cond, d.dim * 2, 32));           // cross kv, K padded 16->32
+      ops.push(attnOp(d.points, d.cond, d.heads, d.dim / d.heads));
+      ops.push(gemmOp(d.points, d.dim, d.dim));          // cross out
+      ops.push(gemmOp(d.points, d.mlp, d.dim));
+      ops.push(gemmOp(d.points, d.dim, d.mlp));
+    }
+    const r = await timeOps(ops);
+    results.push({ name: 'Gaussian 解码', ...r, ops: ops.length });
+    row('Gaussian 解码 (16 块, 2048 点)', `${r.ms.toFixed(0)} ms · ${r.tflop.toFixed(2)} TFLOP · ${r.rate.toFixed(0)} GFLOP/s`, 'ok');
+  }
+
+  // ------------------------------------------------------------ conv anchor
+  {
+    const side = 128, cin = 128, cout = 128;   // one 128→128 3x3 at 128²: the VAE's most repeated op
+    const hw = side * side;
+    const X = dev.createBuffer({ size: hw * cin * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const W = dev.createBuffer({ size: cout * cin * 9 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const Y = dev.createBuffer({ size: hw * cout * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const x = new Float32Array(hw * cin), w = new Float32Array(cout * cin * 9);
+    for (let i = 0; i < x.length; i++) x[i] = gpuRand();
+    for (let i = 0; i < w.length; i++) w[i] = gpuRand() * 0.1;
+    dev.queue.writeBuffer(X, 0, x); dev.queue.writeBuffer(W, 0, w);
+    const bg = dev.createBindGroup({ layout: bglC, entries: [
+      { binding: 0, resource: { buffer: X } }, { binding: 1, resource: { buffer: W } },
+      { binding: 2, resource: { buffer: Y } }, { binding: 3, resource: { buffer: uniDims([side, cin, cout, 0]) } },
+    ]});
+    const encOne = () => {
+      const e = dev.createCommandEncoder();
+      const pass = e.beginComputePass();
+      pass.setPipeline(pConv); pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil((side / 8) * side * (cout / 4) / 64));
+      pass.end();
+      return e.finish();
+    };
+    dev.queue.submit([encOne()]);
+    await dev.queue.onSubmittedWorkDone();
+    let best = Infinity;
+    for (let r = 0; r < 3; r++) {
+      const cmds = encOne();
+      const t0 = performance.now();
+      dev.queue.submit([cmds]);
+      await dev.queue.onSubmittedWorkDone();
+      best = Math.min(best, performance.now() - t0);
+    }
+    const fl = 2 * hw * cout * cin * 9;
+    const rate = fl / (best * 1e6);
+    row('conv 3×3 128→128 @128²（8 像素 tiling）', `${best.toFixed(1)} ms · ${(fl / 1e9).toFixed(1)} GFLOP · ${rate.toFixed(0)} GFLOP/s`, 'ok');
+    const vaeS = CFG.vae.tflop * 1e12 / (rate * 1e9);      // seconds, not ms
+    results.push({ name: 'VAE 编码（按直接卷积估）', ms: vaeS * 1000, tflop: CFG.vae.tflop });
+    row('VAE 编码 (6.75 TFLOP, 按上面的速率)', `${vaeS.toFixed(1)} s · 卷积占绝大多数`, 'dim');
+    log(`  conv 速率区间: 直接卷积 ${rate.toFixed(0)} GFLOP/s → ${vaeS.toFixed(1)} s；` +
+        `若做到 GEMM 的 60%（1020 GFLOP/s）→ ${(CFG.vae.tflop / 1.02).toFixed(1)} s`);
+  }
+
+  // ------------------------------------------------------------ total
+  h2('总额');
+  const dit = 26200;   // block0.html, real int4 weights, 24 blocks x 2 steps
+  results.push({ name: 'DiT 24 块 × 2 步', ms: dit, tflop: 9.1 + 15.4 });
+  let sum = 0; for (const r of results) sum += r.ms;
+  for (const r of results) {
+    row(r.name, `${(r.ms / 1000).toFixed(1)} s  (${(r.ms / sum * 100).toFixed(0)}%)`);
+  }
+  row('合计（不含 BiRefNet 抠图）', `${(sum / 1000).toFixed(1)} s`, sum > 30000 ? 'bad' : 'ok');
+  row('余量', sum > 30000 ? `超出 30 s 目标 ${((sum - 30000) / 1000).toFixed(1)} s` : `还剩 ${((30000 - sum) / 1000).toFixed(1)} s`,
+      sum > 30000 ? 'bad' : 'ok');
+}
+
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>
