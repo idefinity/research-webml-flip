@@ -503,7 +503,12 @@ if __name__ == "__main__":
             note("handing over to k2g for the PLYs")
             import base64  # noqa: PLC0415
             import urllib.request  # noqa: PLC0415
-            sha = os.environ.get("FLIP_SHA", "")
+            # The boot sets FLIP_SHA as a module-level name, not an env var, so
+            # reading only the environment produced an empty string here and
+            # every fetch URL was a 404 - k2g never ran once.
+            sha = (os.environ.get("FLIP_SHA", "")
+                   or str(globals().get("FLIP_SHA", ""))
+                   or "main")
             src = None
             for u in (f"https://raw.githubusercontent.com/idefinity/"
                       f"research-webml-flip/{sha}/scripts/k2g_student_ply.py",
