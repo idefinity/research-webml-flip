@@ -218,12 +218,25 @@ try:
     dyn["feature2"][1] = "LC2"
 
     fp32 = f"{W}/dit.fp32.onnx"
-    p("exporting (one traced forward at LQ=%d, this takes a minute) ..." % LQ)
+    p("wrapper forward once, so a tracing failure is not mistaken for a model bug")
     t0 = time.time()
     with torch.no_grad():
+        outs = wrap(*dummy)
+    p("  ok:", [tuple(o.shape) for o in outs], "in", round(time.time() - t0, 1), "s")
+
+    p("exporting (one traced forward at LQ=%d, this takes a minute) ..." % LQ)
+    t0 = time.time()
+    try:
+        with torch.no_grad():
+            torch.onnx.export(wrap, dummy, fp32, input_names=names,
+                              output_names=["out_latent", "out_camera"],
+                              opset_version=17, dynamo=False, dynamic_axes=dyn)
+    except Exception as e:
+        p("tracing export failed:", traceback.format_exc()[-2500:])
+        p("retrying with the dynamo exporter, opset 18")
         torch.onnx.export(wrap, dummy, fp32, input_names=names,
                           output_names=["out_latent", "out_camera"],
-                          opset_version=17, dynamo=False, dynamic_axes=dyn)
+                          opset_version=18, dynamo=True, dynamic_axes=dyn)
     p("fp32 graph", round(os.path.getsize(fp32) / 1e6, 1), "MB in",
       round(time.time() - t0, 1), "s")
     h = ops_hist(fp32)
@@ -287,7 +300,7 @@ try:
     else:
         p("no HF_TOKEN, skipping upload")
 except Exception:
-    p("FAILED", traceback.format_exc()[:2000])
+    p("FAILED", traceback.format_exc()[:1200] + "\n...\n" + traceback.format_exc()[-2500:])
 
 with open(f"{W}/log.txt", "w") as f:
     f.write("\n".join(log))
