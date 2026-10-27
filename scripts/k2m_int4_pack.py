@@ -43,7 +43,24 @@ OUT = WORK / "k2m"
 OUT.mkdir(parents=True, exist_ok=True)
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-STUDENT = Path(os.environ.get("FLIP_STUDENT", str(WORK / "k2e/student_best.pt")))
+# student_best.pt only exists if the per-epoch eval ever improved; run-1
+# wrote student.pt alone, so looking for one fixed name is how a finished
+# run reports "no checkpoint" and does nothing.
+def _find_student():
+    forced = os.environ.get("FLIP_STUDENT", "").strip()
+    if forced:
+        return Path(forced)
+    for name in ("student_best.pt", "student.pt"):
+        p = WORK / "k2e" / name
+        if p.exists():
+            return p
+    eps = sorted((WORK / "k2e").glob("student_e*.pt"))
+    if eps:
+        return eps[-1]
+    return WORK / "k2e/student_best.pt"
+
+
+STUDENT = _find_student()
 BLOCK = int(os.environ.get("FLIP_INT4_BLOCK", "32"))
 N_SNAP = int(os.environ.get("FLIP_SNAP", "2"))
 ALIGN = 256
