@@ -418,10 +418,14 @@ def main():
     if student_path.exists():
         blob = torch.load(str(student_path), map_location="cpu")
         sd = blob["model"] if isinstance(blob, dict) and "model" in blob else blob
+        # load into the module as it stands (fp16 weights). Casting the module
+        # to fp32 here is what OOMed the first attempt: the teacher's 20-step
+        # CFG run then executes in fp32, doubling every activation, for no
+        # measurement benefit - the student forward runs under autocast anyway.
         student = flow
         student.load_state_dict(sd)
-        student = student.to(DEV).float()
-        note(f"student loaded ({len(sd)} tensors, fp32)")
+        note(f"student loaded ({len(sd)} tensors, module dtype "
+             f"{next(student.parameters()).dtype})")
     else:
         note("NO STUDENT - only the teacher columns will mean anything")
 
