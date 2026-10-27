@@ -18,3 +18,6 @@ k0/
 k1/
 k2/
 fetched_script.py
+
+# playwright-cli scratch (console logs / page snapshots)
+webgpu/.playwright-cli/

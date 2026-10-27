@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>ALU ceiling · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 20px; font-size: 13px; }
+  table { border-collapse: collapse; margin: 8px 0 18px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 5px 14px 5px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>ALU ceiling · WebGPU</h1>
+<p class="sub">纯寄存器 FMA 循环，没有访存。给「1.7 TFLOP/s 还差多远」一个分母——f32 与 f16 各一条。</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const $t = document.getElementById('t');
+const log = s => { document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const row = (k, v, cls) => { const tr = $t.insertRow(); tr.insertCell().textContent = k;
+  const c = tr.insertCell(); c.textContent = v; if (cls) c.className = cls; };
+
+// 8 independent accumulators, 64 FMA each per outer iteration, nothing else.
+const mk = (ty, ops) => /* wgsl */`
+enable f16;
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  var a: array<${ty}, 8>;
+  for (var i = 0u; i < 8u; i = i + 1u) { a[i] = ${ty}(${ty}(gid.x) * 0.0001 + ${ty}(i) * 0.25); }
+  let k = ${ty}(0.9999);
+  let b = ${ty}(0.0001);
+  for (var it = 0u; it < ${ops}u; it = it + 1u) {
+    for (var i = 0u; i < 8u; i = i + 1u) { a[i] = a[i] * k + b; }
+  }
+  var s: ${ty} = ${ty}(0.0);
+  for (var i = 0u; i < 8u; i = i + 1u) { s = s + a[i]; }
+  out[gid.x] = f32(s);
+}
+`;
+
+async function main() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const dev = await adapter.requestDevice({ requiredFeatures: ['shader-f16'],
+    requiredLimits: { maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+                      maxBufferSize: adapter.limits.maxBufferSize } });
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  row('adapter', [adapter.info.vendor, adapter.info.architecture].filter(Boolean).join(' '));
+
+  const THREADS = 1 << 20, OPS = 16384;
+  const ob = dev.createBuffer({ size: THREADS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const db = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  for (const [ty, wgsl] of [['f32', mk('f32', OPS)], ['f16', mk('f16', OPS)]]) {
+    const mod = dev.createShaderModule({ code: wgsl });
+    const ci = await mod.getCompilationInfo();
+    const errs = ci.messages.filter(m => m.type === 'error');
+    if (errs.length) { row(ty, errs[0].message, 'bad'); continue; }
+    const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+    const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: ob } }]});
+    const once = async () => {
+      const enc = dev.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(pipe); p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(THREADS / 256);
+      p.end(); dev.queue.submit([enc.finish()]);
+      await dev.queue.onSubmittedWorkDone();
+    };
+    await once();
+    const rb = dev.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e2 = dev.createCommandEncoder(); e2.copyBufferToBuffer(ob, 0, rb, 0, 4);
+    dev.queue.submit([e2.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const probe = new Float32Array(rb.getMappedRange().slice(0))[0]; rb.unmap();
+    if (!Number.isFinite(probe) || probe === 0) { row(ty + ' FMA', `输出是 ${probe}，这次没算东西`, 'bad'); continue; }
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) { const t = performance.now(); await once(); best = Math.min(best, performance.now() - t); }
+    // 8 FMA per iteration * OPS iterations * threads, 2 flop per FMA
+    const flop = 8 * OPS * THREADS * 2;
+    row(`${ty} FMA`, `${best.toFixed(1)} ms · ${(flop / (best * 1e6)).toFixed(0)} GFLOP/s`);
+  }
+  row('note', '分母有了，再谈 attention 的 1722 GFLOP/s 是几分之几');
+}
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>

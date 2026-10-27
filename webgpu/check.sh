@@ -12,7 +12,12 @@ trap 'kill $SRV 2>/dev/null' EXIT
 sleep 1
 
 playwright-cli close-all >/dev/null 2>&1
-playwright-cli open about:blank >/tmp/pw_open.log 2>&1
+sleep 2
+for i in 1 2 3; do
+  playwright-cli open about:blank >/tmp/pw_open.log 2>&1 && break
+  sleep 2
+done
+sleep 1
 playwright-cli goto "http://127.0.0.1:$PORT/$PAGE?n=$(date +%s)" >/tmp/pw_goto.log 2>&1
 sleep "$WAIT"
 playwright-cli eval "document.getElementById('t').innerText + (document.getElementById('log').textContent ? '\n' + document.getElementById('log').textContent : '')" 2>&1 | sed -n '1,40p'

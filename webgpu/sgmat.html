@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>subgroup matrix GEMM · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 20px; font-size: 13px; }
+  table { border-collapse: collapse; margin: 8px 0 18px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 5px 14px 5px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>subgroup matrix GEMM · WebGPU</h1>
+<p class="sub">8×8 硬件矩阵乘（<code>chromium_experimental_subgroup_matrix</code>）跑 f16 与 int4 权重两条路径，
+对比手写 WGSL 累加器的 743 GFLOP/s。</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const $t = document.getElementById('t'), $log = document.getElementById('log');
+const row = (k, v) => { const tr = $t.insertRow(); tr.insertCell().textContent = k;
+  const c = tr.insertCell(); c.textContent = v; return c; };
+const log = s => { $log.textContent += s + '\n'; console.log(s); };
+
+// f32 -> f16 bits, for uploading as array<f16> storage buffers
+const fbuf = new Float32Array(1), ibuf = new Int32Array(fbuf.buffer);
+function toHalf(x) {
+  fbuf[0] = x; const i = ibuf[0];
+  const s = (i >>> 16) & 0x8000;
+  let e = (i >>> 23) & 0xff, m = i & 0x7fffff;
+  if (e === 0xff) return s | 0x7c00 | (m ? 0x200 : 0);
+  if (e === 0) return s;
+  e = e - 127 + 15;
+  if (e >= 0x1f) return s | 0x7c00;
+  if (e <= 0) { m |= 0x800000; const sh = 1 - e; return s | (m >>> (13 + sh)); }
+  return s | (e << 10) | (m >>> 13);
+}
+const toHalfArr = a => { const o = new Uint16Array(a.length); for (let i = 0; i < a.length; i++) o[i] = toHalf(a[i]); return o; };
+
+const COMMON = /* wgsl */`
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+
+struct Dims { m: u32, n: u32, k: u32, pad: u32 };
+
+@group(0) @binding(0) var<storage, read> A: array<f16>;      // [m][k]
+@group(0) @binding(1) var<storage, read> B: array<f16>;      // [n][k]
+@group(0) @binding(2) var<storage, read> WQ: array<u32>;      // [n][k/8] packed nibbles
+@group(0) @binding(3) var<storage, read> WS: array<f16>;      // [n][k/BLOCK]
+@group(0) @binding(4) var<storage, read_write> C: array<f32>; // [m][n]
+@group(0) @binding(5) var<uniform> d: Dims;
+
+const TILE_ROWS: u32 = 32u;   // m per workgroup
+const TILE_COLS: u32 = 64u;   // n per workgroup
+const TILE_K:    u32 = 32u;   // k per step
+const SUB_ROWS:  u32 = 16u;   // m per subgroup  (2 subgroups in m)
+const SUB_COLS:  u32 = 32u;   // n per subgroup  (2 subgroups in n)
+const BLOCK:     u32 = 32u;   // weights per scale, == TILE_K, so one scale per tile
+
+var<workgroup> tile_A: array<f16, TILE_ROWS * TILE_K>;
+var<workgroup> tile_B: array<f16, TILE_COLS * TILE_K>;
+var<workgroup> scratch: array<array<f32, 64>, 4>;
+
+// A tile: 32 m x 32 k, 8 consecutive k per thread. Rows past m read as zero.
+fn loadA(tile_base: u32, k_idx: u32, row: u32, c_idx: u32) {
+  let g = tile_base + row;
+  let col = c_idx * 8u;
+  for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+    var v: f16 = f16(0.0);
+    if (g < d.m) { v = A[g * d.k + k_idx + col + j]; }
+    tile_A[row * TILE_K + col + j] = v;
+  }
+}
+
+`;
+
+// The two weight paths differ only in how tile_B is filled.
+const LOAD_B_F16 = /* wgsl */`
+fn loadB(tile_base: u32, k_idx: u32, lin: u32) {
+  for (var i: u32 = lin; i < TILE_COLS * TILE_K; i = i + 128u) {
+    let r = i / TILE_K;
+    let c = i % TILE_K;
+    var v: f16 = f16(0.0);
+    if (tile_base + r < d.n) { v = B[(tile_base + r) * d.k + k_idx + c]; }
+    tile_B[i] = v;
+  }
+}
+`;
+
+// int4: word = 8 nibbles = 8 consecutive k, low nibble first. One fp16 scale
+// per (row, 32 k), and the tile is exactly 32 k wide, so the scale multiplies
+// in once per row when the tile is filled - not per element in the MMA.
+const LOAD_B_INT4 = /* wgsl */`
+fn loadB(tile_base: u32, k_idx: u32, lin: u32) {
+  let wpr: u32 = d.k / 8u;
+  let spr: u32 = d.k / BLOCK;
+  for (var i: u32 = lin; i < TILE_COLS * (TILE_K / 8u); i = i + 128u) {
+    let r = i / (TILE_K / 8u);
+    let w = i % (TILE_K / 8u);
+    let gr = tile_base + r;
+    var p: u32 = 0u;
+    var s: f32 = 0.0;
+    if (gr < d.n) {
+      p = WQ[gr * wpr + k_idx / 8u + w];
+      s = f32(WS[gr * spr + k_idx / BLOCK]);
+    }
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let code = f32((p >> (8u * (j >> 1u) + 4u * (j & 1u))) & 0xFu) - 8.0;
+      tile_B[r * TILE_K + w * 8u + j] = f16(code * s);
+    }
+  }
+}
+`;
+
+const MAIN = /* wgsl */`
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) lid: u32,
+        @builtin(subgroup_invocation_id) lane: u32,
+        @builtin(subgroup_size) sgsz: u32) {
+  let a_base: u32 = wid.y * TILE_ROWS;
+  let w_base: u32 = wid.x * TILE_COLS;
+
+  let sub: u32 = lid / sgsz;        // 0..3
+  let sub_x: u32 = sub / 2u;        // column block
+  let sub_y: u32 = sub % 2u;        // row block
+  let base_A: u32 = sub_y * SUB_ROWS;
+  let base_B: u32 = sub_x * SUB_COLS;
+
+  var c00: subgroup_matrix_result<f32, 8, 8>;
+  var c01: subgroup_matrix_result<f32, 8, 8>;
+  var c02: subgroup_matrix_result<f32, 8, 8>;
+  var c03: subgroup_matrix_result<f32, 8, 8>;
+  var c10: subgroup_matrix_result<f32, 8, 8>;
+  var c11: subgroup_matrix_result<f32, 8, 8>;
+  var c12: subgroup_matrix_result<f32, 8, 8>;
+  var c13: subgroup_matrix_result<f32, 8, 8>;
+
+  for (var kidx: u32 = 0u; kidx < d.k; kidx = kidx + TILE_K) {
+    loadA(a_base, kidx, lid / 4u, lid % 4u);
+    loadB(w_base, kidx, lid);
+    workgroupBarrier();
+
+    for (var step: u32 = 0u; step < TILE_K; step = step + 8u) {
+      let ao: u32 = sub_y * SUB_ROWS * TILE_K + step;
+      let a0 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&tile_A, ao, false, TILE_K);
+      let a1 = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&tile_A, ao + 8u * TILE_K, false, TILE_K);
+
+      let bo: u32 = sub_x * SUB_COLS * TILE_K + step;
+      let b0 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&tile_B, bo, true, TILE_K);
+      let b1 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&tile_B, bo + 8u * TILE_K, true, TILE_K);
+      let b2 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&tile_B, bo + 16u * TILE_K, true, TILE_K);
+      let b3 = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&tile_B, bo + 24u * TILE_K, true, TILE_K);
+
+      c00 = subgroupMatrixMultiplyAccumulate(a0, b0, c00);
+      c01 = subgroupMatrixMultiplyAccumulate(a0, b1, c01);
+      c02 = subgroupMatrixMultiplyAccumulate(a0, b2, c02);
+      c03 = subgroupMatrixMultiplyAccumulate(a0, b3, c03);
+      c10 = subgroupMatrixMultiplyAccumulate(a1, b0, c10);
+      c11 = subgroupMatrixMultiplyAccumulate(a1, b1, c11);
+      c12 = subgroupMatrixMultiplyAccumulate(a1, b2, c12);
+      c13 = subgroupMatrixMultiplyAccumulate(a1, b3, c13);
+    }
+    workgroupBarrier();
+  }
+
+  // The accumulator layout is opaque, so it goes out through workgroup memory.
+  let r: u32 = lane / 4u;
+  let c: u32 = (lane % 4u) * 2u;
+  var off: u32 = (a_base + base_A) * d.n + w_base + base_B;
+  var lim: i32 = i32(d.m) - i32(a_base + base_A);
+
+  subgroupMatrixStore(&scratch[sub], 0u, c00, false, 8u);
+  emit(off, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c01, false, 8u);
+  emit(off + 8u, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c02, false, 8u);
+  emit(off + 16u, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c03, false, 8u);
+  emit(off + 24u, r, c, sub, lim);
+
+  off = off + 8u * d.n;
+  lim = i32(d.m) - i32(a_base + base_A + 8u);
+  subgroupMatrixStore(&scratch[sub], 0u, c10, false, 8u);
+  emit(off, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c11, false, 8u);
+  emit(off + 8u, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c12, false, 8u);
+  emit(off + 16u, r, c, sub, lim);
+  subgroupMatrixStore(&scratch[sub], 0u, c13, false, 8u);
+  emit(off + 24u, r, c, sub, lim);
+}
+
+fn emit(off: u32, r: u32, c: u32, slot: u32, lim: i32) {
+  if (lim > 0 && r < u32(lim)) {
+    C[off + r * d.n + c] = scratch[slot][r * 8u + c];
+    C[off + r * d.n + c + 1u] = scratch[slot][r * 8u + c + 1u];
+  }
+}
+`;
+
+const shader = kind => COMMON + (kind === 'int4' ? LOAD_B_INT4 : LOAD_B_F16) + MAIN;
+
+let dev, adapter, sgmat = false;
+
+async function init() {
+  if (!navigator.gpu) throw new Error('no navigator.gpu');
+  adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('no adapter');
+  const info = adapter.info || {};
+  row('adapter', `${info.vendor || '?'} · ${info.architecture || '?'} · ${info.description || ''}`);
+  const feats = [...adapter.features].sort();
+  row('features', feats.join(', ') || '(none)');
+  sgmat = adapter.features.has('chromium-experimental-subgroup-matrix');
+  row('subgroup matrix', sgmat ? 'available' : 'NOT available');
+  const lim = adapter.limits;
+  row('limits', `workgroup storage ${(lim.maxComputeWorkgroupStorageSize / 1024).toFixed(0)} KB · ` +
+                `buffer ${(lim.maxStorageBufferBindingSize / 2 ** 20).toFixed(1)} MiB`);
+
+  const want = ['shader-f16', 'subgroups'];
+  if (sgmat) want.push('chromium-experimental-subgroup-matrix');
+  dev = await adapter.requestDevice({
+    requiredFeatures: want.filter(f => adapter.features.has(f)),
+    requiredLimits: {
+      maxComputeWorkgroupStorageSize: lim.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
+      maxBufferSize: lim.maxBufferSize,
+    },
+  });
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  row('device', `subgroup size ${dev.features.has('subgroups') ? 'via builtin' : 'n/a'}` +
+                ` · f16 ${dev.features.has('shader-f16')}`);
+  return sgmat;
+}
+
+function mkBuf(data, usage) {
+  const b = dev.createBuffer({ size: Math.ceil(data.byteLength / 16) * 16, usage });
+  dev.queue.writeBuffer(b, 0, data);
+  return b;
+}
+
+async function runGEMM(M, N, K, kind, check) {
+  const rnd = (() => { let s = 12345; return () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff * 2 - 1; })();
+  // f16 weights on the GPU either way; the int4 path quantizes them first, so
+  // both kernels compute the same function up to quantization error.
+  const A = new Float32Array(M * K), W = new Float32Array(N * K);
+  for (let i = 0; i < A.length; i++) A[i] = rnd() * 0.1;
+  for (let i = 0; i < W.length; i++) W[i] = rnd() * 0.1;
+
+  let words, scales;
+  if (kind === 'int4') {
+    const BLK = 32;
+    words = new Uint32Array(N * K / 8);
+    scales = new Uint16Array(N * K / BLK);
+    for (let n = 0; n < N; n++) {
+      for (let k0 = 0; k0 < K; k0 += BLK) {
+        let mx = 0;
+        for (let j = 0; j < BLK; j++) mx = Math.max(mx, Math.abs(W[n * K + k0 + j]));
+        const s = mx > 0 ? mx / 7 : 1e-8;
+        scales[n * (K / BLK) + k0 / BLK] = toHalf(s);
+        for (let w = 0; w < BLK / 8; w++) {
+          let word = 0;
+          for (let j = 0; j < 8; j++) {
+            const q = Math.max(-8, Math.min(7, Math.round(W[n * K + k0 + w * 8 + j] / s)));
+            word |= ((q + 8) & 0xf) << (4 * j);
+          }
+          words[n * (K / 8) + k0 / 8 + w] = word >>> 0;
+        }
+      }
+    }
+    // reference against the dequantized weights, not the originals
+    for (let n = 0; n < N; n++) for (let k = 0; k < K; k++) {
+      const s = WSval(scales, n, k, K);
+      const q = (words[n * (K / 8) + (k >> 3)] >>> (4 * (k & 7))) & 0xf;
+      W[n * K + k] = (q - 8) * s;
+    }
+  }
+
+  const U = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+  const bA = mkBuf(toHalfArr(A), U);
+  const bB = mkBuf(toHalfArr(W), U);
+  const bWQ = mkBuf(kind === 'int4' ? words : new Uint32Array(16), U);
+  const bWS = mkBuf(kind === 'int4' ? scales : new Uint16Array(16), U);
+  const bC = dev.createBuffer({ size: M * N * 4, usage: U | GPUBufferUsage.COPY_SRC });
+  const bD = mkBuf(new Uint32Array([M, N, K, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+
+  const mod = dev.createShaderModule({ code: shader(kind) });
+  const infoMsg = await mod.getCompilationInfo?.();
+  if (infoMsg) for (const m of infoMsg.messages) if (m.type === 'error') log(`shader ${kind}: ${m.message} @${m.lineNum}`);
+  const pipe = dev.createComputePipeline({ layout: 'auto',
+    compute: { module: mod, entryPoint: 'main' } });
+  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bA } }, { binding: 1, resource: { buffer: bB } },
+    { binding: 2, resource: { buffer: bWQ } }, { binding: 3, resource: { buffer: bWS } },
+    { binding: 4, resource: { buffer: bC } }, { binding: 5, resource: { buffer: bD } },
+  ]});
+
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(Math.ceil(N / 64), Math.ceil(M / 32));
+  pass.end();
+  dev.queue.submit([enc.finish()]);
+
+  let out = null, err = -1;
+  if (check) {
+    const rb = dev.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const e2 = dev.createCommandEncoder(); e2.copyBufferToBuffer(bC, 0, rb, 0, M * N * 4);
+    dev.queue.submit([e2.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    out = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+    let ref = 0, num = 0;
+    for (let m = 0; m < M; m++) for (let n = 0; n < N; n++) {
+      let s = 0; for (let k = 0; k < K; k++) s += A[m * K + k] * W[n * K + k];
+      num = Math.max(num, Math.abs(s - out[m * N + n])); ref = Math.max(ref, Math.abs(s));
+    }
+    err = num / ref;
+  }
+  return { err, M, N, K };
+}
+
+function WSval(scales, n, k, K) {
+  const bits = scales[n * (K / 32) + (k >> 5)];
+  const s = (bits & 0x8000) ? -1 : 1, e = (bits >> 10) & 0x1f, m = bits & 0x3ff;
+  if (e === 0) return s * m * 2 ** -24;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * (1 + m / 1024) * 2 ** (e - 15);
+}
+
+async function bench(M, N, K, kind) {
+  const U = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+  const bA = dev.createBuffer({ size: M * K * 2, usage: U });
+  const bB = dev.createBuffer({ size: N * K * 2, usage: U });
+  const bC = dev.createBuffer({ size: M * N * 4, usage: U });
+  const wq = dev.createBuffer({ size: N * K / 2, usage: U });
+  const ws = dev.createBuffer({ size: N * K / 16 * 2, usage: U });
+  const bD = mkBuf(new Uint32Array([M, N, K, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const mod = dev.createShaderModule({ code: shader(kind) });
+  const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bA } }, { binding: 1, resource: { buffer: bB } },
+    { binding: 2, resource: { buffer: wq } }, { binding: 3, resource: { buffer: ws } },
+    { binding: 4, resource: { buffer: bC } }, { binding: 5, resource: { buffer: bD } },
+  ]});
+  const once = async () => {
+    const enc = dev.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(pipe); p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(Math.ceil(N / 64), Math.ceil(M / 32));
+    p.end(); dev.queue.submit([enc.finish()]);
+    await dev.queue.onSubmittedWorkDone();
+  };
+  await once();
+  const t0 = performance.now();
+  const R = 5;
+  for (let i = 0; i < R; i++) await once();
+  return (performance.now() - t0) / R;
+}
+
+(async () => {
+  try {
+    const ok = await init();
+    if (!ok) { row('verdict', '这台机器的 Chrome 没开 subgroup matrix，后面跳过'); return; }
+
+    for (const kind of ['f16', 'int4']) {
+      const r = await runGEMM(40, 72, 96, kind, true);
+      const c = row(`correctness ${kind} (M=40 N=72 K=96)`, `max rel err ${r.err.toExponential(2)}`);
+      c.className = r.err < 2e-2 ? 'ok' : 'bad';
+    }
+
+    for (const [M, N, K] of [[8192, 3072, 1024], [12293, 1536, 1536]]) {
+      for (const kind of ['f16', 'int4']) {
+        const ms = await bench(M, N, K, kind);
+        const fl = 2 * M * N * K;
+        row(`gemm ${M}x${N}x${K} ${kind}`, `${ms.toFixed(1)} ms · ${(fl / (ms * 1e6)).toFixed(0)} GFLOP/s`);
+      }
+    }
+    row('note', '对手写累加器版本：743 GFLOP/s (8192x3072x1024, int4, 69 ms)');
+  } catch (e) {
+    log('FAILED: ' + (e && e.message ? e.message : e));
+    row('verdict', 'failed, see log');
+  }
+})();
+</script>
+</body>
+</html>
