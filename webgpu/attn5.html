@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>attention 占用率 A/B · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 20px; font-size: 13px; }
+  table { border-collapse: collapse; margin: 8px 0 18px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 5px 14px 5px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>attention 占用率 A/B · WebGPU</h1>
+<p class="sub">唯一变量是每个线程算几行 query：4 行 → 64 行 tile / 24 KB 共享 → 每 SM 驻留 1 个 workgroup；
+2 行 → 32 行 tile / 16 KB → 驻留 2 个。两个内核在同一页交替测。</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const $t = document.getElementById('t');
+const logEl = document.getElementById('log');
+function row(k, v, cls) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+}
+function log(s) { logEl.textContent += s + '\n'; console.log(s); }
+
+// R query rows per thread. Everything else is identical, so the only thing
+// being compared is how many workgroups fit in 32 KB of workgroup memory:
+//   R=4  BQ=64   8 KB + 8 KB + 8 KB = 24 KB  -> 1 resident
+//   R=2  BQ=32   4 KB + 8 KB + 4 KB = 16 KB  -> 2 resident
+// The cost of R=2 is instruction mix: 6 loads per 32 FMAs instead of 8 per 64.
+function attnKernel(R) {
+  const BQ = 16 * R;
+  const comp = ['x', 'y', 'z', 'w'];
+  let pv = '';
+  for (let j = 0; j < 4; j++) {
+    pv += `      {
+        let gr = k0 + kg * 4u + ${j}u;
+        if (gr < d.l) {
+          let v4 = vec4<f32>(ksv[(kg * 4u + ${j}u) * HD4 + rx]);
+`;
+    for (let i = 0; i < R; i++) pv += `          o[${i}] = o[${i}] + v4 * q4[${i}].${comp[j]};\n`;
+    pv += `        }
+      }
+`;
+  }
+  const decl = n => Array.from({ length: R }, (_, i) => `o[${i}]`).join(', ');
+  return /* wgsl */`
+enable f16;
+enable subgroups;
+
+struct Dims { l: u32, h: u32, hd: u32, scale: f32 };
+@group(0) @binding(0) var<storage, read> Q4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> K4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> V4: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+
+const BQ = ${BQ}u;
+const R = ${R}u;
+const BK = 64u;
+const HD4 = 16u;
+const BK4 = 16u;
+
+var<workgroup> qs: array<vec4<f16>, ${BQ * 16}>;
+var<workgroup> ksv: array<vec4<f16>, 1024>;
+var<workgroup> ss: array<vec4<f16>, ${BQ * 16}>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32) {
+  let h = wid.y;
+  let q0 = wid.x * BQ;
+  let stride4 = (d.h * d.hd) / 4u;
+  let base4 = (h * d.hd) / 4u;
+  let scale = d.scale;
+  let r0 = R * (tid / 16u);
+  let rx = tid % 16u;
+  let c0 = 4u * rx;
+
+  for (var f = 0u; f < R; f = f + 1u) {
+    let idx = tid * R + f;
+    let r = idx / HD4;
+    let t = idx % HD4;
+    let gr = q0 + r;
+    var v = vec4<f32>(0.0);
+    if (gr < d.l) { v = Q4[gr * stride4 + base4 + t]; }
+    qs[r * HD4 + t] = vec4<f16>(v);
+  }
+
+  var o: array<vec4<f32>, R>;
+  var mrun: array<f32, R>;
+  var lrun: array<f32, R>;
+  for (var i = 0u; i < R; i = i + 1u) { o[i] = vec4<f32>(0.0); mrun[i] = -1e30; lrun[i] = 0.0; }
+
+  workgroupBarrier();
+
+  let nblk = (d.l + BK - 1u) / BK;
+  for (var b = 0u; b < nblk; b = b + 1u) {
+    let k0 = b * BK;
+
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let r = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + r;
+      var v = vec4<f32>(0.0);
+      if (gr < d.l) { v = K4[gr * stride4 + base4 + t]; }
+      ksv[t * BK + r] = vec4<f16>(v);
+    }
+    workgroupBarrier();
+
+    var p4: array<vec4<f32>, R>;
+    {
+      var acc: array<f32, ${R * 4}>;
+      for (var i = 0u; i < ${R * 4}u; i = i + 1u) { acc[i] = 0.0; }
+      for (var t = 0u; t < HD4; t = t + 1u) {
+        var qa: array<vec4<f16>, R>;
+        for (var i = 0u; i < R; i = i + 1u) { qa[i] = qs[(r0 + i) * HD4 + t]; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+          let kv = ksv[t * BK + c0 + j];
+          for (var i = 0u; i < R; i = i + 1u) { acc[i * 4u + j] = acc[i * 4u + j] + f32(dot(qa[i], kv)); }
+        }
+      }
+      for (var i = 0u; i < R; i = i + 1u) {
+        var p = vec4<f32>(acc[i * 4u + 0u], acc[i * 4u + 1u], acc[i * 4u + 2u], acc[i * 4u + 3u]) * scale;
+        let key = k0 + c0;
+        if (key + 3u >= d.l) {
+          let keep = vec4<bool>(key < d.l, key + 1u < d.l, key + 2u < d.l, key + 3u < d.l);
+          p = select(vec4<f32>(-1e4), p, keep);
+        }
+        p4[i] = p;
+      }
+    }
+
+    for (var i = 0u; i < R; i = i + 1u) {
+      var mx = max(max(p4[i].x, p4[i].y), max(p4[i].z, p4[i].w));
+      mx = max(mx, subgroupShuffleXor(mx, 1u));
+      mx = max(mx, subgroupShuffleXor(mx, 2u));
+      mx = max(mx, subgroupShuffleXor(mx, 4u));
+      mx = max(mx, subgroupShuffleXor(mx, 8u));
+      let nm = max(mrun[i], mx);
+      let alpha = select(0.0, exp(mrun[i] - nm), mrun[i] > -1e29);
+      mrun[i] = nm;
+      let e = exp(p4[i] - vec4<f32>(nm));
+      var s = e.x + e.y + e.z + e.w;
+      s = s + subgroupShuffleXor(s, 1u);
+      s = s + subgroupShuffleXor(s, 2u);
+      s = s + subgroupShuffleXor(s, 4u);
+      s = s + subgroupShuffleXor(s, 8u);
+      lrun[i] = lrun[i] * alpha + s;
+      o[i] = o[i] * alpha;
+      ss[(r0 + i) * BK4 + rx] = vec4<f16>(e);
+    }
+    workgroupBarrier();
+
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let key = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + key;
+      var v = vec4<f32>(0.0);
+      if (gr < d.l) { v = V4[gr * stride4 + base4 + t]; }
+      ksv[key * HD4 + t] = vec4<f16>(v);
+    }
+    workgroupBarrier();
+
+    for (var kg = 0u; kg < BK4; kg = kg + 1u) {
+      var q4: array<vec4<f32>, R>;
+      for (var i = 0u; i < R; i = i + 1u) { q4[i] = vec4<f32>(ss[(r0 + i) * BK4 + kg]); }
+${pv}    }
+    workgroupBarrier();
+  }
+
+  for (var i = 0u; i < R; i = i + 1u) {
+    let gr = q0 + r0 + i;
+    if (gr >= d.l) { continue; }
+    let inv = 1.0 / max(lrun[i], 1e-20);
+    let at = (gr * stride4 + base4) * 4u + c0;
+    O[at] = o[i].x * inv;
+    O[at + 1u] = o[i].y * inv;
+    O[at + 2u] = o[i].z * inv;
+    O[at + 3u] = o[i].w * inv;
+  }
+}
+`;
+}
+
+let seed = 4242;
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5;
+
+function cpuAttn(Q, K, V, L, H, D) {
+  const out = new Float32Array(L * H * D), scale = 1 / Math.sqrt(D);
+  for (let h = 0; h < H; h++)
+    for (let i = 0; i < L; i++) {
+      const s = new Float32Array(L);
+      let mx = -Infinity;
+      for (let j = 0; j < L; j++) {
+        let a = 0;
+        for (let d = 0; d < D; d++) a += Q[i * H * D + h * D + d] * K[j * H * D + h * D + d];
+        s[j] = a * scale; mx = Math.max(mx, s[j]);
+      }
+      let sum = 0;
+      for (let j = 0; j < L; j++) { s[j] = Math.exp(s[j] - mx); sum += s[j]; }
+      for (let d = 0; d < D; d++) {
+        let a = 0;
+        for (let j = 0; j < L; j++) a += s[j] * V[j * H * D + h * D + d];
+        out[i * H * D + h * D + d] = a / sum;
+      }
+    }
+  return out;
+}
+
+async function main() {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const dev = await adapter.requestDevice({
+    requiredFeatures: ['shader-f16', 'subgroups'],
+    requiredLimits: {
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  row('adapter', [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join(' '));
+
+  const bgl = dev.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ]});
+  const layout = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
+
+  const ROWS = [4, 2];
+  const pipes = {}, BQ = {};
+  for (const R of ROWS) {
+    const mod = dev.createShaderModule({ code: attnKernel(R) });
+    const ci = await mod.getCompilationInfo();
+    const errs = ci.messages.filter(m => m.type === 'error');
+    if (errs.length) { row(`R=${R}`, errs[0].message, 'bad'); return; }
+    pipes[R] = dev.createComputePipeline({ layout, compute: { module: mod, entryPoint: 'main' } });
+    BQ[R] = 16 * R;
+  }
+  row('shaders', ROWS.map(r => `R=${r} (BQ=${BQ[r]}, ${BQ[r] * 16 * 16 / 1024} KB)`).join(' · '), 'ok');
+
+  function setup(L, H, D) {
+    const n = L * H * D;
+    const Q = new Float32Array(n), K = new Float32Array(n), V = new Float32Array(n);
+    for (let i = 0; i < n; i++) { Q[i] = rnd(); K[i] = rnd(); V[i] = rnd(); }
+    const buf = (a) => {
+      const b = dev.createBuffer({ size: a.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      dev.queue.writeBuffer(b, 0, a); return b;
+    };
+    const ob = dev.createBuffer({ size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const db = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(db, 0, new Uint32Array([L, H, D, 0]));
+    dev.queue.writeBuffer(db, 12, new Float32Array([1 / Math.sqrt(D)]));
+    const groups = {};
+    for (const R of ROWS) {
+      groups[R] = dev.createBindGroup({ layout: bgl, entries: [
+        { binding: 0, resource: { buffer: buf(Q) } }, { binding: 1, resource: { buffer: buf(K) } },
+        { binding: 2, resource: { buffer: buf(V) } }, { binding: 3, resource: { buffer: ob } },
+        { binding: 4, resource: { buffer: db } }]});
+    }
+    return { Q, K, V, n, ob, groups };
+  }
+
+  function encode(st, R, L, H) {
+    const enc = dev.createCommandEncoder();
+    const p = enc.beginComputePass();
+    p.setPipeline(pipes[R]); p.setBindGroup(0, st.groups[R]);
+    p.dispatchWorkgroups(Math.ceil(L / BQ[R]), H);
+    p.end();
+    return enc.finish();
+  }
+
+  async function once(st, R, L, H) {
+    const t0 = performance.now();
+    dev.queue.submit([encode(st, R, L, H)]);
+    await dev.queue.onSubmittedWorkDone();
+    return performance.now() - t0;
+  }
+
+  // correctness against the CPU on a length that exercises the partial tail
+  {
+    const L = 130, H = 2, D = 64;
+    const st = setup(L, H, D);
+    const ref = cpuAttn(st.Q, st.K, st.V, L, H, D);
+    for (const R of ROWS) {
+      dev.queue.submit([encode(st, R, L, H)]);
+      const rb = dev.createBuffer({ size: st.n * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const e = dev.createCommandEncoder(); e.copyBufferToBuffer(st.ob, 0, rb, 0, st.n * 4);
+      dev.queue.submit([e.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const C = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap();
+      let err = 0; for (let i = 0; i < C.length; i++) err = Math.max(err, Math.abs(C[i] - ref[i]));
+      row(`check R=${R}`, `max|gpu-cpu| ${err.toExponential(2)}`, err < 2e-3 ? 'ok' : 'bad');
+    }
+  }
+
+  const L = 12293, H = 16, D = 64;
+  const st = setup(L, H, D);
+  const best = {}; for (const R of ROWS) best[R] = Infinity;
+  for (const R of ROWS) await once(st, R, L, H);
+  for (let round = 0; round < 5; round++)
+    for (const R of ROWS) best[R] = Math.min(best[R], await once(st, R, L, H));
+
+  const fl = 4 * L * L * D * H;
+  for (const R of ROWS) {
+    row(`R=${R} BQ=${BQ[R]}`, `${best[R].toFixed(0)} ms · ${(fl / (best[R] * 1e6)).toFixed(0)} GFLOP/s`);
+  }
+  const gain = best[ROWS[0]] / best[ROWS[1]];
+  row('R=4 → R=2', `${gain.toFixed(2)}×`, gain > 1.05 ? 'ok' : 'bad');
+}
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>
