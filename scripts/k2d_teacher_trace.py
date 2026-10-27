@@ -35,6 +35,12 @@ Env:
   FLIP_FORK_MIN_GB refuse to fork below this much free RAM (default 16)
   FLIP_FETCH_N     download this many photos if the inputs are short (default 0)
   FLIP_FETCH_TPL   url template with {s} seed and {size} px (default picsum)
+  FLIP_IMG_HF      HuggingFace dataset repo to draw inputs from instead, e.g.
+                   DownFlow/fuliji. Read through datasets-server, one URL per
+                   row, so the dataset is never downloaded. Takes priority over
+                   the repo's four examples.
+  FLIP_IMG_HF_ROWS how many rows to pull (default: as many as needed)
+  FLIP_IMG_HF_COLUMN  image column name (default "image")
 """
 
 import hashlib
@@ -44,6 +50,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -364,6 +371,88 @@ def unwrap(rec):
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 
+def fetch_hf(n):
+    """Pull n images out of any HuggingFace image dataset, by repo name.
+
+    This goes through datasets-server rather than downloading a parquet: it
+    returns one URL per row, so a run can take 200 images out of a 50 GB
+    dataset without paying for the dataset. K2l measured it working from this
+    box (8/8 rows for DownFlow/fuliji, 222 rows total).
+
+    Why it matters: the four repo examples give the student four conditioning
+    features to latch onto. Any larger, more diverse set is strictly better
+    for that, and now the choice of set is an env var instead of a rewrite.
+    """
+    repo = os.environ.get("FLIP_IMG_HF", "").strip()
+    if not repo:
+        return []
+    rows_want = max(n, int(os.environ.get("FLIP_IMG_HF_ROWS", "0")) or n)
+    column = os.environ.get("FLIP_IMG_HF_COLUMN", "image").strip()
+    split = os.environ.get("FLIP_IMG_HF_SPLIT", "train").strip()
+    dst = WORK / "inputs"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    def _get(url, timeout=90):
+        req = urllib.request.Request(url, headers={"User-Agent": "flip-trace"})
+        with urllib.request.urlopen(req, timeout=timeout) as fh:
+            return fh.read()
+
+    # config names are not guessable, so ask rather than assume
+    cfg = None
+    try:
+        q = urllib.parse.urlencode({"dataset": repo})
+        splits = json.loads(_get(
+            f"https://datasets-server.huggingface.co/splits?{q}"))["splits"]
+        if splits:
+            cfg, split = splits[0].get("config"), splits[0].get("split", split)
+    except Exception:  # noqa: BLE001
+        note("  hf splits lookup failed, trying the defaults")
+
+    got = []
+    offset = 0
+    while len(got) < rows_want:
+        q = {"dataset": repo, "split": split, "offset": offset,
+             "length": min(100, rows_want - len(got))}
+        if cfg:
+            q["config"] = cfg
+        try:
+            js = json.loads(_get(
+                "https://datasets-server.huggingface.co/rows?"
+                + urllib.parse.urlencode(q)))
+        except Exception:  # noqa: BLE001
+            note(f"  hf rows failed at offset {offset}")
+            break
+        rows = js.get("rows") or []
+        if not rows:
+            break
+        for r in rows:
+            cell = (r.get("row") or {}).get(column)
+            src = cell.get("src") if isinstance(cell, dict) else None
+            if not src:
+                continue
+            path = dst / f"hf_{len(got):04d}.jpg"
+            if path.exists() and path.stat().st_size > 1024:
+                got.append(path)
+                continue
+            try:
+                blob = _get(src, timeout=60)
+                if blob[:2] != b"\xff\xd8" and blob[:8] != b"\x89PNG\r\n\x1a\n":
+                    continue
+                tmp = path.with_suffix(".jpg.part")
+                tmp.write_bytes(blob)
+                os.replace(tmp, path)
+                got.append(path)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(got) >= rows_want:
+                break
+        offset += len(rows)
+        if offset >= (js.get("num_rows_total") or 0):
+            break
+    note(f"fetched {len(got)} images from HF dataset {repo}")
+    return got
+
+
 def fetch_photos(n):
     """Download n photos when nothing is attached.
 
@@ -413,6 +502,9 @@ def pick_images():
     straightening.
     """
     cands = []
+    if os.environ.get("FLIP_IMG_HF", "").strip():
+        # a named dataset comes first; the four examples are only filler then
+        cands += fetch_hf(N_IMG)
     ex = REPO / "static" / "example_inputs"
     if ex.is_dir():
         cands += [p for p in sorted(ex.glob("*")) if p.suffix.lower() in IMG_EXT]
