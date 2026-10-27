@@ -18,7 +18,7 @@
 </head>
 <body>
 <h1>subgroup matrix GEMM · WebGPU</h1>
-<p class="sub">8×8 硬件矩阵乘（<code>chromium_experimental_subgroup_matrix</code>）跑 f16 与 int4 权重两条路径，
+<p class="sub">8×8 矩阵乘（<code>chromium_experimental_subgroup_matrix</code>，需要 <code>--enable-unsafe-webgpu</code>）跑 f16 与 int4 权重两条路径，
 对比手写 WGSL 累加器的 743 GFLOP/s。</p>
 <table id="t"><tr><th>stage</th><th>result</th></tr></table>
 <div id="log"></div>
@@ -178,32 +178,51 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
   let c: u32 = (lane % 4u) * 2u;
   var off: u32 = (a_base + base_A) * d.n + w_base + base_B;
   var lim: i32 = i32(d.m) - i32(a_base + base_A);
+  let nlim: i32 = i32(d.n) - i32(w_base + base_B);
 
   subgroupMatrixStore(&scratch[sub], 0u, c00, false, 8u);
-  emit(off, r, c, sub, lim);
+  emit(off, r, c, sub, lim, nlim);
+  workgroupBarrier();               // 同一格 slot 会被下一次 store 覆盖，读完再走
   subgroupMatrixStore(&scratch[sub], 0u, c01, false, 8u);
-  emit(off + 8u, r, c, sub, lim);
+
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off + 8u, r, c, sub, lim, nlim);
+  workgroupBarrier();
   subgroupMatrixStore(&scratch[sub], 0u, c02, false, 8u);
-  emit(off + 16u, r, c, sub, lim);
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off + 16u, r, c, sub, lim, nlim);
+  workgroupBarrier();
   subgroupMatrixStore(&scratch[sub], 0u, c03, false, 8u);
-  emit(off + 24u, r, c, sub, lim);
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off + 24u, r, c, sub, lim, nlim);
+  workgroupBarrier();
 
   off = off + 8u * d.n;
   lim = i32(d.m) - i32(a_base + base_A + 8u);
   subgroupMatrixStore(&scratch[sub], 0u, c10, false, 8u);
-  emit(off, r, c, sub, lim);
+
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off, r, c, sub, lim, nlim);
+  workgroupBarrier();
   subgroupMatrixStore(&scratch[sub], 0u, c11, false, 8u);
-  emit(off + 8u, r, c, sub, lim);
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off + 8u, r, c, sub, lim, nlim);
+  workgroupBarrier();
   subgroupMatrixStore(&scratch[sub], 0u, c12, false, 8u);
-  emit(off + 16u, r, c, sub, lim);
+  workgroupBarrier();      // 别的 lane 可能要读我写的那两个元素
+  emit(off + 16u, r, c, sub, lim, nlim);
+  workgroupBarrier();
   subgroupMatrixStore(&scratch[sub], 0u, c13, false, 8u);
-  emit(off + 24u, r, c, sub, lim);
+  emit(off + 24u, r, c, sub, lim, nlim);
 }
 
-fn emit(off: u32, r: u32, c: u32, slot: u32, lim: i32) {
+// 行和列都要夹住。只夹行的话，N 不是 64 的倍数时最后一块会往右写进下一行，
+// 于是"错的是别人"，正确性检查看到的是一个 6e-2 的差值，很难往越界上想。
+fn emit(off: u32, r: u32, c: u32, slot: u32, lim: i32, nlim: i32) {
   if (lim > 0 && r < u32(lim)) {
-    C[off + r * d.n + c] = scratch[slot][r * 8u + c];
-    C[off + r * d.n + c + 1u] = scratch[slot][r * 8u + c + 1u];
+    let at = off + r * d.n;
+    if (c < u32(nlim)) { C[at + c] = scratch[slot][r * 8u + c]; }
+    if (c + 1u < u32(nlim)) { C[at + c + 1u] = scratch[slot][r * 8u + c + 1u]; }
   }
 }
 `;
@@ -246,6 +265,21 @@ function mkBuf(data, usage) {
   const b = dev.createBuffer({ size: Math.ceil(data.byteLength / 16) * 16, usage });
   dev.queue.writeBuffer(b, 0, data);
   return b;
+}
+
+// layout:'auto' 会把着色器里没引用的 binding 从布局中删掉：f16 变体不碰 WQ/WS，
+// int4 变体不碰 B。所以两条路都只能绑自己真正引用的那几个。
+// 绑多了的后果不是报编译错，而是整个 bind group 失效、dispatch 一次都不跑——
+// 但计时照样出数，而且是离谱的好看（这里曾量出 103079 GFLOP/s）。
+function bindEntries(kind, b) {
+  const e = [{ binding: 0, resource: { buffer: b.A } }];
+  if (kind === 'int4') {
+    e.push({ binding: 2, resource: { buffer: b.WQ } }, { binding: 3, resource: { buffer: b.WS } });
+  } else {
+    e.push({ binding: 1, resource: { buffer: b.B } });
+  }
+  e.push({ binding: 4, resource: { buffer: b.C } }, { binding: 5, resource: { buffer: b.D } });
+  return e;
 }
 
 async function runGEMM(M, N, K, kind, check) {
@@ -298,11 +332,8 @@ async function runGEMM(M, N, K, kind, check) {
   if (infoMsg) for (const m of infoMsg.messages) if (m.type === 'error') log(`shader ${kind}: ${m.message} @${m.lineNum}`);
   const pipe = dev.createComputePipeline({ layout: 'auto',
     compute: { module: mod, entryPoint: 'main' } });
-  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: { buffer: bA } }, { binding: 1, resource: { buffer: bB } },
-    { binding: 2, resource: { buffer: bWQ } }, { binding: 3, resource: { buffer: bWS } },
-    { binding: 4, resource: { buffer: bC } }, { binding: 5, resource: { buffer: bD } },
-  ]});
+  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0),
+    entries: bindEntries(kind, { A: bA, B: bB, WQ: bWQ, WS: bWS, C: bC, D: bD }) });
 
   const enc = dev.createCommandEncoder();
   const pass = enc.beginComputePass();
@@ -319,12 +350,15 @@ async function runGEMM(M, N, K, kind, check) {
     await rb.mapAsync(GPUMapMode.READ);
     out = new Float32Array(rb.getMappedRange().slice(0));
     rb.unmap();
-    let ref = 0, num = 0;
+    let ref = 0, num = 0, wi = 0, wj = 0, want = 0;
     for (let m = 0; m < M; m++) for (let n = 0; n < N; n++) {
       let s = 0; for (let k = 0; k < K; k++) s += A[m * K + k] * W[n * K + k];
-      num = Math.max(num, Math.abs(s - out[m * N + n])); ref = Math.max(ref, Math.abs(s));
+      const d = Math.abs(s - out[m * N + n]);
+      if (d > num) { num = d; wi = m; wj = n; want = s; }
+      ref = Math.max(ref, Math.abs(s));
     }
     err = num / ref;
+    return { err, M, N, K, wi, wj, got: out[wi * N + wj], want };
   }
   return { err, M, N, K };
 }
@@ -347,11 +381,8 @@ async function bench(M, N, K, kind) {
   const bD = mkBuf(new Uint32Array([M, N, K, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
   const mod = dev.createShaderModule({ code: shader(kind) });
   const pipe = dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
-  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: { buffer: bA } }, { binding: 1, resource: { buffer: bB } },
-    { binding: 2, resource: { buffer: wq } }, { binding: 3, resource: { buffer: ws } },
-    { binding: 4, resource: { buffer: bC } }, { binding: 5, resource: { buffer: bD } },
-  ]});
+  const bg = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0),
+    entries: bindEntries(kind, { A: bA, B: bB, WQ: wq, WS: ws, C: bC, D: bD }) });
   const once = async () => {
     const enc = dev.createCommandEncoder();
     const p = enc.beginComputePass();
@@ -373,8 +404,12 @@ async function bench(M, N, K, kind) {
     if (!ok) { row('verdict', '这台机器的 Chrome 没开 subgroup matrix，后面跳过'); return; }
 
     for (const kind of ['f16', 'int4']) {
-      const r = await runGEMM(40, 72, 96, kind, true);
-      const c = row(`correctness ${kind} (M=40 N=72 K=96)`, `max rel err ${r.err.toExponential(2)}`);
+      const qs = new URLSearchParams(location.search);
+      const cm = +qs.get('cm') || 40, cn = +qs.get('cn') || 72, ck = +qs.get('ck') || 96;
+      const r = await runGEMM(cm, cn, ck, kind, true);
+      const c = row(`correctness ${kind} (M=${cm} N=${cn} K=${ck})`,
+        `max rel err ${r.err.toExponential(2)}` +
+        (r.wi !== undefined ? ` · worst (${r.wi},${r.wj}) got ${r.got.toExponential(3)} want ${r.want.toExponential(3)}` : ''));
       c.className = r.err < 2e-2 ? 'ok' : 'bad';
     }
 
@@ -385,7 +420,7 @@ async function bench(M, N, K, kind) {
         row(`gemm ${M}x${N}x${K} ${kind}`, `${ms.toFixed(1)} ms · ${(fl / (ms * 1e6)).toFixed(0)} GFLOP/s`);
       }
     }
-    row('note', '对手写累加器版本：743 GFLOP/s (8192x3072x1024, int4, 69 ms)');
+    row('note', '对手写累加器：同一形状 1591–1796 GFLOP/s。743 是早先把 100 MB 回读算进计时的错数，别再引用');
   } catch (e) {
     log('FAILED: ' + (e && e.message ? e.message : e));
     row('verdict', 'failed, see log');

@@ -1289,7 +1289,19 @@ attention 的三版是同一形状下只改访存和归约顺序：v1 每行一�
 
 **tile 形状比内层写法值钱。** 同一个内核换三种写法，量出来的是反直觉的顺序：TM=64 / TN=128（1796）> TM=128 / TN=64（1591）> 每 4 个 k 用 vec4 读（1325）。原因在 A 的重读次数——N=3072 时 TN=64 要把 A 拉 48 遍，TN=128 只拉 24 遍。而 vec4 那条**更慢**：少了一半 load，多了一堆同时活着的寄存器，净亏。**"把标量读换成 vec4"这个招式在 GEMM 上不成立**，它只在 attention 里成立（那里省下来的是指令数，不是寄存器预算）。
 
-**subgroup-matrix 拿不到。** Chrome 155 / apple metal-3 暴露了 `shader-f16`、`subgroups`、`subgroup-size-control`、`timestamp-query`，唯独没有 `chromium-experimental-subgroup-matrix`，加 `--enable-webgpu-developer-features` 也没有。`sgmat.html` 就是那个探针：f16 / int4 双路对照已经写好，第一行打印 NOT available 就退出——所以这个特性如果哪天出现，代价只是重跑一次。
+**subgroup-matrix：默认不给，一个开关就能有，但有了也没用。** 不加任何开关时，Chrome 155 / apple metal-3 只暴露 `shader-f16`、`subgroups`、`subgroup-size-control`、`timestamp-query`，确实没有 `chromium-experimental-subgroup-matrix`——早先那句话到此为止是对的。加 `--enable-unsafe-webgpu` 之后它就出现了，也就是说**硬件和驱动都能做，锁在开关后面**。
+
+把它打开量了一次（`sgmat.html`，先修了三个 bug：`layout:'auto'` 会丢掉未引用的 binding 导致 bind group 整体失效、store 与 emit 之间缺同步、N 不是 64 的倍数时往右写越界；修完在整块形状上 rel err 8.1e-4）：
+
+| 8192×3072×1024 | GFLOP/s |
+|---|---|
+| 手写 SIMT，f16（已有） | 1796 |
+| subgroup-matrix，f16 | 1745–1857 |
+| subgroup-matrix，int4 权重 | **2099–2122** |
+
+**f16 的 MMA 和标量 FMA 是同一档**——Apple 的 GPU 没有一个能从 WebGPU 摸到的独立矩阵通路，`subgroupMatrixMultiplyAccumulate` 落回同一批 ALU。所以 MMA 本身不给任何东西，这一条和之前的预算结论一致，只是理由从"拿不到"变成"拿到了也一样"。
+
+**真正的新信息是 int4 在 MMA 路径上第一次赢了**：2105 对 1796 = **1.17×**，而且稳定复现。原因不在算术，在访存——每块 tile 的权重字节少 4 倍，反量化的 8 次移位加 1 次乘摊在 tile 装载里。这也划出了它的上限：**int4 省下的正好是 f16 等待权重流量花掉的那段时间。** f16 内核现在只跑到峰值的 47–57%，所以还有 1.17× 可捡；等内核调到 85%，那段时间就没了，反量化的成本重新暴露，比值会掉回 1 以下。换句话说：**先修调度，再谈 4 bit；两个不能倒过来做。**
 
 对照物是 HF Space 那份 `webml-community/gemma-4-webgpu-kernels`（缓存在 `~/.cache/huggingface/hub/`）。它确实把 8×8 f16 MMA 摆在最高一档：四个内核模板 `enable chromium_experimental_subgroup_matrix`，32 处 `subgroupMatrixMultiplyAccumulate`。但设备特性按适配器能力取交集请求，拿不到就不请求、不报错，自动降级到 SIMT。**在这台机器上它跑的也是标量路径。**
 
@@ -1383,7 +1395,7 @@ attention 的三版是同一形状下只改访存和归约顺序：v1 每行一�
 - 阶段 0–2 不支持移动端
 - 不追求“背面长得像本人”
 - **不再优化 INT4 GEMM 的算力**（三次否证，且没有 MMA 时理论上限就是 f16 减去反量化）
-- **不再追 subgroup-matrix 路径**（本机拿不到该特性；探针留着，特性出现再重跑一次）
+- **不再追 subgroup-matrix 路径**（加 `--enable-unsafe-webgpu` 能拿到，但量出来和标量同档 1.75–1.86 TFLOPS，见 K2n）
 - **不在内核接线之前做微优化**（代理指标会被 dispatch 和布局转换吃掉）
 
 ---
@@ -1457,7 +1469,7 @@ block 0 的四个矩阵（qkv 1024→3072、out 1024→1024、mlp 1024→4096、
 - 反方向（8×8 每线程、更高算术强度）需要 4 倍共享内存，32 KB 装不下。
 
 **所以 64×64×64、每线程 4×4、24 KB，是这张卡上的局部最优，不是随手选的。**
-真要提高，只有两条路：硬件矩阵乘（`chromium-experimental-subgroup-matrix`，这台 Mac 没有），
+真要提高，只有两条路：硬件矩阵乘（`chromium-experimental-subgroup-matrix`，要开 `--enable-unsafe-webgpu`，开了也只到 1.8 TFLOPS），
 或者减少 token 数（改模型）。
 
 **这一轮撤回的数字**：以前写的 int4 GEMM「743 GFLOP/s」是计时区间里混了 100 MB 回读造成的，
