@@ -46,6 +46,41 @@ def p(*a):
     print(s, flush=True)
 
 
+def total_size(url):
+    """A torch checkpoint is a zip: its central directory sits at the end, so a
+    file padded or truncated to a guessed length loads as 'corrupted'. Ask for
+    the length instead of assuming 1,482,000,000."""
+    req = urllib.request.Request(url, headers={"Range": "bytes=0-0", "User-Agent": "flip-export"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        cr = r.headers.get("Content-Range") or ""
+        if "/" in cr:
+            return int(cr.split("/")[-1])
+        return int(r.headers.get("Content-Length", 0)) or None
+
+
+def fetch_stream(url, out):
+    """Fallback for when the length cannot be asked for: append in order."""
+    off = os.path.getsize(out) if os.path.exists(out) else 0
+    for attempt in range(6):
+        try:
+            h = {"User-Agent": "flip-export"}
+            if off:
+                h["Range"] = f"bytes={off}-"
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=600) as r, \
+                    open(out, "ab" if off else "wb") as f:
+                while True:
+                    b = r.read(1 << 22)
+                    if not b:
+                        break
+                    f.write(b)
+                    off += len(b)
+            return off
+        except Exception:
+            off = os.path.getsize(out) if os.path.exists(out) else 0
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError("streaming fetch failed")
+
+
 def fetch_ranged(url, out, size, threads=24):
     chunk = max(size // (threads * 4), 1 << 20)
     spans = [(i, min(i + chunk, size)) for i in range(0, size, chunk)]
@@ -122,9 +157,26 @@ try:
 
     # ---- student weights
     p("fetching student.pt ...")
-    fetch_ranged(STUDENT_URL, f"{W}/student.pt", 1482 * 1000 * 1000)
+    size = None
+    try:
+        size = total_size(STUDENT_URL)
+    except Exception as e:
+        p("  length probe failed:", str(e)[:120])
+    if size:
+        p("  size from server:", size)
+        fetch_ranged(STUDENT_URL, f"{W}/student.pt", size)
+    else:
+        fetch_stream(STUDENT_URL, f"{W}/student.pt")
     size = os.path.getsize(f"{W}/student.pt")
     p("student.pt", size, "bytes")
+    h = hashlib.sha256()
+    with open(f"{W}/student.pt", "rb") as f:
+        while True:
+            b = f.read(1 << 22)
+            if not b:
+                break
+            h.update(b)
+    p("student.pt sha256", h.hexdigest())
 
     flow = M.LatentSeqMMFlowModel(**args)
     sd = torch.load(f"{W}/student.pt", map_location="cpu")
