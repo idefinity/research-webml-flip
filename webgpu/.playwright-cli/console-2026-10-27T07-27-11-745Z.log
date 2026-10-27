@@ -1,0 +1,24 @@
+[      41ms] [LOG] GPU error: Error while parsing WGSL: :34:25 error: expected ';' for variable declaration
+var<workgroup> ml: array<f32, 2u * BQ];
+                        ^
+
+:35:25 error: expected ';' for variable declaration
+var<workgroup> al: array<f32, BQ];
+                        ^
+
+
+ - While calling [Device].CreateShaderModule([ShaderModuleDescriptor]).
+ @ http://127.0.0.1:8791/attn.html:197
+[      41ms] [WARNING] Error while parsing WGSL: :34:25 error: expected ';' for variable declaration
+var<workgroup> ml: array<f32, 2u * BQ];
+                        ^
+
+:35:25 error: expected ';' for variable declaration
+var<workgroup> al: array<f32, BQ];
+                        ^
+
+
+ - While calling [Device].CreateShaderModule([ShaderModuleDescriptor]).
+ @ http://127.0.0.1:8791/attn.html:0
+[      41ms] [LOG] 34:25 expected ';' for variable declaration
+35:25 expected ';' for variable declaration @ http://127.0.0.1:8791/attn.html:197

@@ -1,0 +1,8 @@
+- generic [active] [ref=f1e1]:
+  - heading "flash attention · WebGPU" [level=1] [ref=f1e2]
+  - paragraph [ref=f1e3]: 一个 workgroup 负责「一个 head × 32 个 query 行」，键方向按 64 分块，online softmax。对应 DiT 里 12293 token 的全自注意力。
+  - table [ref=f1e4]:
+    - rowgroup [ref=f1e5]:
+      - row [ref=f1e6]:
+        - columnheader "stage" [ref=f1e7]
+        - columnheader "result" [ref=f1e8]

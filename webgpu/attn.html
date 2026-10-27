@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>flash attention · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 20px; font-size: 13px; }
+  table { border-collapse: collapse; margin: 8px 0 18px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 5px 14px 5px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>flash attention · WebGPU</h1>
+<p class="sub">一个 workgroup 负责「一个 head × 64 个 query 行」，键方向按 64 分块，online softmax，全部按 vec4 读写。对应 DiT 里 12293 token 的全自注意力。</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const wgsl = /* wgsl */`
+enable f16;
+
+// 64 query rows x 64 keys per workgroup, 4x4 per thread, everything vec4.
+//
+// Three versions, same shapes, only the memory access pattern changed:
+//   32 rows, scalar reads, 2x4     731 GFLOP/s
+//   64 rows, scalar reads, 4x4     943 GFLOP/s
+//   64 rows, vec4 reads,  4x4     (this one)
+// The tile is read eight times per sixteen FMAs when everything is scalar; a
+// vec4<f16> load plus dot() turns that into eight FMAs per instruction.
+//
+//   qs  64x16 vec4<f16>   8 KB   Q, [row][dim/4]
+//   ks  16x64 vec4<f16>   8 KB   K, [dim/4][key] so a dot walks along keys
+//   ss  64x16 vec4<f16>   8 KB   scores, then probabilities, [row][key/4]
+//
+// P is f16 because its values are in [0,1]; the row sum is f32 on the side.
+struct Dims { l: u32, h: u32, hd: u32, scale: f32 };
+
+@group(0) @binding(0) var<storage, read> Q4: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> K4: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> V4: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+
+const BQ = 64u;
+const BK = 64u;
+const HD4 = 16u;
+const BK4 = 16u;
+const MODE = 0u;   // 1 = S only, 2 = skip S; both are timing probes, not results
+
+var<workgroup> qs: array<vec4<f16>, 1024>;
+var<workgroup> ksv: array<vec4<f16>, 1024>;  // K transposed, then V in the same 8 KB
+var<workgroup> ss: array<vec4<f16>, 1024>;
+var<workgroup> ml: array<f32, 128>;
+var<workgroup> al: array<f32, 64>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) tid: u32) {
+  let h = wid.y;
+  let q0 = wid.x * BQ;
+  let stride4 = (d.h * d.hd) / 4u;
+  let base4 = (h * d.hd) / 4u;
+  let scale = d.scale;
+
+  let r0 = 4u * (tid / 16u);
+  let c0 = 4u * (tid % 16u);
+
+  if (tid < BQ) { ml[tid] = -1e30; ml[BQ + tid] = 0.0; }
+
+  // Q tile: 64 rows x 16 vec4
+  for (var f = 0u; f < 4u; f = f + 1u) {
+    let idx = tid * 4u + f;
+    let r = idx / HD4;
+    let t = idx % HD4;
+    let gr = q0 + r;
+    var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (gr < d.l) { v = Q4[gr * stride4 + base4 + t]; }
+    qs[r * HD4 + t] = vec4<f16>(v);
+  }
+
+  var o: array<vec4<f32>, 4>;
+  for (var i = 0u; i < 4u; i = i + 1u) { o[i] = vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+
+  workgroupBarrier();
+
+  let nblk = (d.l + BK - 1u) / BK;
+  for (var b = 0u; b < nblk; b = b + 1u) {
+    let k0 = b * BK;
+
+    // K tile, transposed: [dim/4][key]
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let r = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + r;
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (gr < d.l) { v = K4[gr * stride4 + base4 + t]; }
+      ksv[t * BK + r] = vec4<f16>(v);
+    }
+    workgroupBarrier();
+
+    // S = Q K^T
+    if (MODE != 2u) {
+    var acc: array<f32, 16>;
+    for (var i = 0u; i < 16u; i = i + 1u) { acc[i] = 0.0; }
+    for (var t = 0u; t < HD4; t = t + 1u) {
+      var qa: array<vec4<f32>, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { qa[i] = vec4<f32>(qs[(r0 + i) * HD4 + t]); }
+      for (var j = 0u; j < 4u; j = j + 1u) {
+        let kv = vec4<f32>(ksv[t * BK + c0 + j]);
+        for (var i = 0u; i < 4u; i = i + 1u) { acc[i * 4u + j] = acc[i * 4u + j] + dot(qa[i], kv); }
+      }
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      var p = vec4<f32>(acc[i * 4u + 0u], acc[i * 4u + 1u], acc[i * 4u + 2u], acc[i * 4u + 3u]) * scale;
+      let key = k0 + c0;
+      if (key + 3u >= d.l) {
+        let keep = vec4<bool>(key < d.l, key + 1u < d.l, key + 2u < d.l, key + 3u < d.l);
+        p = select(vec4<f32>(-1e4, -1e4, -1e4, -1e4), p, keep);
+      }
+      ss[(r0 + i) * BK4 + c0 / 4u] = vec4<f16>(p);
+    }
+    }
+    workgroupBarrier();
+
+    // V into the buffer K just vacated: same 8 KB, [key][dim/4]. Reading V
+    // from global cost 16 redundant copies (one per row group in the warp);
+    // from workgroup memory it is one coalesced load and then broadcasts.
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let key = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + key;
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (gr < d.l) { v = V4[gr * stride4 + base4 + t]; }
+      ksv[key * HD4 + t] = vec4<f16>(v);
+    }
+
+    // V into the buffer K just vacated: same 8 KB, [key][dim/4]. Reading V
+    // from global cost 16 redundant copies (one per row group in the warp);
+    // from workgroup memory it is one coalesced load and then broadcasts.
+    for (var f = 0u; f < 4u; f = f + 1u) {
+      let idx = tid * 4u + f;
+      let key = idx / HD4;
+      let t = idx % HD4;
+      let gr = k0 + key;
+      var v = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+      if (gr < d.l) { v = V4[gr * stride4 + base4 + t]; }
+      ksv[key * HD4 + t] = vec4<f16>(v);
+    }
+
+    // online softmax, one thread per row
+    if (MODE != 1u && tid < BQ) {
+      var mx = -1e30;
+      for (var c = 0u; c < BK4; c = c + 1u) {
+        let p4 = ss[tid * BK4 + c];
+        mx = max(mx, max(max(f32(p4.x), f32(p4.y)), max(f32(p4.z), f32(p4.w))));
+      }
+      let old = ml[tid];
+      let nm = max(old, mx);
+      let alpha = select(0.0, exp(old - nm), old > -1e29);
+      al[tid] = alpha;
+      var sum = 0.0;
+      for (var c = 0u; c < BK4; c = c + 1u) {
+        let p4 = ss[tid * BK4 + c];
+        let e = vec4<f32>(exp(f32(p4.x) - nm), exp(f32(p4.y) - nm),
+                          exp(f32(p4.z) - nm), exp(f32(p4.w) - nm));
+        sum = sum + e.x + e.y + e.z + e.w;
+        ss[tid * BK4 + c] = vec4<f16>(e);
+      }
+      ml[tid] = nm;
+      ml[BQ + tid] = ml[BQ + tid] * alpha + sum;
+    }
+    workgroupBarrier();
+
+    // O += P V, four keys at a time; V comes straight out of global (L2)
+    for (var i = 0u; i < 4u; i = i + 1u) { o[i] = o[i] * al[r0 + i]; }
+    for (var kg = 0u; kg < BK4 && MODE != 1u; kg = kg + 1u) {
+      var p4: array<vec4<f32>, 4>;
+      for (var i = 0u; i < 4u; i = i + 1u) { p4[i] = vec4<f32>(ss[(r0 + i) * BK4 + kg]); }
+      for (var j = 0u; j < 4u; j = j + 1u) {
+        let gr = k0 + kg * 4u + j;
+        if (gr < d.l) {
+          let v4 = vec4<f32>(ksv[(kg * 4u + j) * HD4 + c0 / 4u]);
+          for (var i = 0u; i < 4u; i = i + 1u) {
+            let p = select(p4[i].w, select(p4[i].z, select(p4[i].y, p4[i].x, j < 1u), j < 2u), j < 3u);
+            o[i] = o[i] + v4 * p;
+          }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let gr = q0 + r0 + i;
+    if (gr >= d.l) { continue; }
+    let inv = 1.0 / max(ml[BQ + r0 + i], 1e-20);
+    let at = (gr * stride4 + base4) * 4u + c0;
+    O[at] = o[i].x * inv;
+    O[at + 1u] = o[i].y * inv;
+    O[at + 2u] = o[i].z * inv;
+    O[at + 3u] = o[i].w * inv;
+  }
+}
+`;
+
+const $t = document.getElementById('t');
+const logEl = document.getElementById('log');
+function row(k, v, cls) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+}
+function log(s) { logEl.textContent += s + '\n'; console.log(s); }
+
+let seed = 987654321;
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5;
+
+function cpuAttn(Q, K, V, L, H, D) {
+  const out = new Float32Array(L * H * D);
+  const scale = 1 / Math.sqrt(D);
+  for (let h = 0; h < H; h++) {
+    for (let i = 0; i < L; i++) {
+      const s = new Float32Array(L);
+      let mx = -Infinity;
+      for (let j = 0; j < L; j++) {
+        let acc = 0;
+        for (let d = 0; d < D; d++) acc += Q[i * H * D + h * D + d] * K[j * H * D + h * D + d];
+        s[j] = acc * scale;
+        mx = Math.max(mx, s[j]);
+      }
+      let sum = 0;
+      for (let j = 0; j < L; j++) { s[j] = Math.exp(s[j] - mx); sum += s[j]; }
+      for (let d = 0; d < D; d++) {
+        let acc = 0;
+        for (let j = 0; j < L; j++) acc += s[j] * V[j * H * D + h * D + d];
+        out[i * H * D + h * D + d] = acc / sum;
+      }
+    }
+  }
+  return out;
+}
+
+async function main() {
+  if (!navigator.gpu) { row('WebGPU', '不可用', 'bad'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) { row('adapter', 'none', 'bad'); return; }
+  const info = adapter.info || {};
+  row('adapter', [info.vendor, info.architecture, info.description].filter(Boolean).join(' '));
+  const hasF16 = adapter.features.has('shader-f16');
+  row('shader-f16', hasF16 ? 'yes' : 'no — kernel needs it', hasF16 ? 'ok' : 'bad');
+  if (!hasF16) return;
+
+  const dev = await adapter.requestDevice({
+    requiredFeatures: ['shader-f16'],
+    requiredLimits: {
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  const module = dev.createShaderModule({ code: wgsl });
+  const ci = await module.getCompilationInfo();
+  const errs = ci.messages.filter(m => m.type === 'error');
+  if (errs.length) {
+    row('shader', `${errs.length} errors`, 'bad');
+    log(errs.map(e => `${e.lineNum}:${e.linePos} ${e.message}`).join('\n'));
+    return;
+  }
+  row('shader', 'compiled', 'ok');
+
+  const buf = (data, usage) => {
+    const b = dev.createBuffer({ size: Math.max(16, data.byteLength), usage: usage | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(b, 0, data);
+    return b;
+  };
+
+  const bgl = dev.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ]});
+  const makePipe = (mode) => dev.createComputePipeline({
+    layout: dev.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    compute: { module: dev.createShaderModule({ code: wgsl.replace('const MODE = 0u;', `const MODE = ${mode}u;`) }), entryPoint: 'main' },
+  });
+  const pipes = { 0: makePipe(0), 1: makePipe(1), 2: makePipe(2) };
+  const pipe = pipes[0];
+
+  async function run(L, H, D, check, mode = 0) {
+    const Q = new Float32Array(L * H * D), K = new Float32Array(L * H * D), V = new Float32Array(L * H * D);
+    for (let i = 0; i < Q.length; i++) { Q[i] = rnd(); K[i] = rnd(); V[i] = rnd(); }
+    const qb = buf(Q, GPUBufferUsage.STORAGE);
+    const kb = buf(K, GPUBufferUsage.STORAGE);
+    const vb = buf(V, GPUBufferUsage.STORAGE);
+    const ob = dev.createBuffer({ size: L * H * D * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const db = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(db, 0, new Uint32Array([L, H, D, 0]));
+    dev.queue.writeBuffer(db, 12, new Float32Array([1 / Math.sqrt(D)]));
+
+    const group = dev.createBindGroup({ layout: bgl, entries: [
+      { binding: 0, resource: { buffer: qb } }, { binding: 1, resource: { buffer: kb } },
+      { binding: 2, resource: { buffer: vb } }, { binding: 3, resource: { buffer: ob } },
+      { binding: 4, resource: { buffer: db } },
+    ]});
+
+    const rb = dev.createBuffer({ size: L * H * D * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipes[mode]); pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(L / 64), H);
+    pass.end();
+    enc.copyBufferToBuffer(ob, 0, rb, 0, L * H * D * 4);
+    const t0 = performance.now();
+    dev.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const ms = performance.now() - t0;
+    const out = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+
+    let err = 0;
+    if (check) {
+      const ref = cpuAttn(Q, K, V, L, H, D);
+      for (let i = 0; i < out.length; i++) err = Math.max(err, Math.abs(out[i] - ref[i]));
+    }
+    const flops = 4 * L * L * D * H;
+    return { ms, err, flops };
+  }
+
+  const small = await run(40, 2, 64, true);
+  row('check L=40 H=2', `max|gpu-cpu| = ${small.err.toExponential(2)}`, small.err < 2e-3 ? 'ok' : 'bad');
+
+  for (const [L, H] of [[4096, 16], [8192, 16], [12293, 16]]) {
+    const r = await run(L, H, 64, false);
+    row(`attn L=${L} H=${H} d=64`, `${r.ms.toFixed(1)} ms · ${(r.flops / (r.ms * 1e6)).toFixed(0)} GFLOP/s`);
+  }
+  const full = await run(12293, 16, 64, false, 0);
+  const onlyS = await run(12293, 16, 64, false, 1);
+  const noS = await run(12293, 16, 64, false, 2);
+  row('breakdown L=12293', `S ${onlyS.ms.toFixed(0)} ms · softmax+PV ${noS.ms.toFixed(0)} ms · 合计 ${full.ms.toFixed(0)} ms`);
+  row('note', '24 个主 block，每步一次；12293 那行就是一个 block 的实测');
+}
+
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+- generic [active] [ref=f2e1]:
+  - heading "flash attention · WebGPU" [level=1] [ref=f2e2]
+  - paragraph [ref=f2e3]: 一个 workgroup 负责「一个 head × 32 个 query 行」，键方向按 64 分块，online softmax。对应 DiT 里 12293 token 的全自注意力。
+  - table [ref=f2e4]:
+    - rowgroup [ref=f2e5]:
+      - row [ref=f2e6]:
+        - columnheader "stage" [ref=f2e7]
+        - columnheader "result" [ref=f2e8]
+    - row [ref=f2e9]:
+      - cell "adapter" [ref=f2e10]
+      - cell "apple metal-3" [ref=f2e11]
+    - row [ref=f2e12]:
+      - cell "shader-f16" [ref=f2e13]
+      - cell "yes" [ref=f2e14]
+    - row [ref=f2e15]:
+      - cell "shader" [ref=f2e16]
+      - cell "2 errors" [ref=f2e17]
+  - generic [ref=f2e18]: "GPU error: Error while parsing WGSL: :34:25 error: expected ';' for variable declaration var<workgroup> ml: array<f32, 2u * BQ]; ^ :35:25 error: expected ';' for variable declaration var<workgroup> al: array<f32, BQ]; ^ - While calling [Device].CreateShaderModule([ShaderModuleDescriptor]). 34:25 expected ';' for variable declaration 35:25 expected ';' for variable declaration"
