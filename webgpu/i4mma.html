@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>DiT · int4 权重上矩阵通路 · WebGPU</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 20px; font-size: 13px; max-width: 74ch; }
+  table { border-collapse: collapse; margin: 8px 0 18px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 5px 14px 5px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; } .dim { color: #9c9a92; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>DiT · int4 权重上矩阵通路</h1>
+<p class="sub">
+真的 <code>int4.bin</code>，真的形状。权重留在 4 bit 里，进 workgroup tile 时才反量化成 f16，
+然后交给 <code>subgroupMatrixMultiplyAccumulate</code> 的 8×8 乘法。
+要求 <code>--enable-unsafe-webgpu</code>；拿不到特性就打印 NOT available 并退出。
+对照是同机上 <code>block0.html</code> 的标量路径，跑在同一批权重、同一个 L 上。
+</p>
+<table id="t"><tr><th>stage</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+const $t = document.getElementById('t');
+const logEl = document.getElementById('log');
+function row(k, v, cls) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+  return tr.lastElementChild;
+}
+function log(s) { logEl.textContent += s + '\n'; console.log(s); }
+
+const L = 12293;          // 一次 DiT 前向的 token 数
+const TK = 32;            // k 步长，同时是一个 scale block 的宽度
+
+/* ------------------------------------------------------------------ 内核
+   每个 workgroup 4 个 subgroup（128 线程），排成 2×2：
+   每个 subgroup 负责 TM/2 行 × TN/2 列，内部再切成 8×8 的累加块。
+
+   和标量版本的区别只有三处，但每一处都值钱：
+     1. A 只在装载时转一次 f16，之后由 MMA 消费；
+     2. int4 码值在装载 tile 时反量化，一块 tile 被 TM 行复用；
+     3. 累加结果直接从 MMA 落到 storage buffer（stride = n），
+        不经过 workgroup 暂存，也就没有 store/read 之间的屏障。 */
+function wgsl(TM, TN) {
+  const SUB_R = TM / 2, SUB_C = TN / 2;      // 每个 subgroup 的行列
+  const NR = SUB_R / 8, NC = SUB_C / 8;      // 每 subgroup 的累加块数
+  const accs = [];
+  for (let a = 0; a < NR; a++) for (let b = 0; b < NC; b++) accs.push([a, b]);
+
+  let decl = '', body = '', store = '';
+  for (const [a, b] of accs) decl += `  var c${a}${b}: subgroup_matrix_result<f32, 8, 8>;\n`;
+  for (let s = 0; s < TK; s += 8) {
+    body += `    {\n`;
+    for (let a = 0; a < NR; a++) {
+      body += `    let a${a} = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>` +
+              `(&tA, (sgR * ${SUB_R}u + ${a * 8}u) * ${TK}u + ${s}u, false, ${TK}u);\n`;
+    }
+    for (let b = 0; b < NC; b++) {
+      body += `    let b${b} = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>` +
+              `(&tB, (sgC * ${SUB_C}u + ${b * 8}u) * ${TK}u + ${s}u, true, ${TK}u);\n`;
+    }
+    for (const [a, b] of accs) {
+      body += `    c${a}${b} = subgroupMatrixMultiplyAccumulate(a${a}, b${b}, c${a}${b});\n`;
+    }
+    body += `    }\n`;
+  }
+  for (const [a, b] of accs) {
+    store += `  subgroupMatrixStore(&C, (row0 + sgR * ${SUB_R}u + ${a * 8}u) * d.n` +
+             ` + col0 + sgC * ${SUB_C}u + ${b * 8}u, c${a}${b}, false, d.n);\n`;
+  }
+  return wgsl_head(TM, TN)
+    .replace('__DECL__', decl)
+    .replace('__BODY__', body)
+    .replace('__STORE__', store);
+}
+
+// 上面那段把 loadA/loadB 和 main 分开写，是为了让累加器的生成留在 JS 里。
+function wgsl_head(TM, TN) {
+  const SUB_R = TM / 2, SUB_C = TN / 2;
+  return /* wgsl */`
+enable f16;
+enable subgroups;
+enable chromium_experimental_subgroup_matrix;
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+
+struct Dims { m: u32, n: u32, k: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> Wq: array<u32>;
+@group(0) @binding(2) var<storage, read> Ws: array<f32>;
+@group(0) @binding(3) var<storage, read_write> C: array<f32>;
+@group(0) @binding(4) var<uniform> d: Dims;
+
+const TM: u32 = ${TM}u;
+const TN: u32 = ${TN}u;
+
+var<workgroup> tA: array<f16, ${TM * TK}>;
+var<workgroup> tB: array<f16, ${TN * TK}>;
+
+fn loadA(row0: u32, kidx: u32, lid: u32) {
+  for (var i: u32 = lid; i < ${TM * TK}u; i = i + 128u) {
+    let r = i / ${TK}u;
+    let c = i % ${TK}u;
+    let g = row0 + r;
+    var v: f16 = f16(0.0);
+    if (g < d.m) { v = f16(A[g * d.k + kidx + c]); }
+    tA[i] = v;
+  }
+}
+
+fn loadB(col0: u32, kidx: u32, lid: u32) {
+  let wpr: u32 = d.k / 8u;
+  let spr: u32 = d.k / 32u;
+  for (var i: u32 = lid; i < ${TN * (TK / 8)}u; i = i + 128u) {
+    let r = i / ${TK / 8}u;
+    let w = i % ${TK / 8}u;
+    let gr = col0 + r;
+    var p: u32 = 0u;
+    var sc: f32 = 0.0;
+    if (gr < d.n) {
+      p = Wq[gr * wpr + kidx / 8u + w];
+      sc = Ws[gr * spr + kidx / 32u];
+    }
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let code = f32((p >> (8u * (j >> 1u) + 4u * (j & 1u))) & 0xFu) - 8.0;
+      tB[r * ${TK}u + w * 8u + j] = f16(code * sc);
+    }
+  }
+}
+
+@compute @workgroup_size(128, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) lid: u32,
+        @builtin(subgroup_size) sgsz: u32) {
+  let row0: u32 = wid.y * TM;
+  let col0: u32 = wid.x * TN;
+  let sg: u32 = lid / sgsz;
+  let sgR: u32 = sg / 2u;
+  let sgC: u32 = sg % 2u;
+
+__DECL__
+  for (var kidx: u32 = 0u; kidx < d.k; kidx = kidx + ${TK}u) {
+    loadA(row0, kidx, lid);
+    loadB(col0, kidx, lid);
+    workgroupBarrier();
+__BODY__
+    workgroupBarrier();
+  }
+
+__STORE__
+}
+`;
+}
+
+/* ------------------------------------------------------------------ 宿主 */
+async function main() {
+  if (!navigator.gpu) { row('WebGPU', '没有 navigator.gpu', 'bad'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const feat = 'chromium-experimental-subgroup-matrix';
+  const has = adapter.features.has(feat);
+  row('subgroup matrix', has ? 'available' : 'NOT available（用 --enable-unsafe-webgpu 启动）', has ? 'ok' : 'bad');
+  if (!has) return;
+
+  const dev = await adapter.requestDevice({
+    requiredFeatures: [feat, 'shader-f16', 'subgroups'],
+    requiredLimits: {
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize,
+    },
+  });
+  dev.addEventListener('uncapturederror', e => log('GPU error: ' + e.error.message));
+  row('adapter', `${adapter.info?.vendor || '?'} · ${adapter.info?.architecture || '?'}`);
+
+  const man = await (await fetch('manifest.json')).json();
+  const block = man.tensors.filter(t => t.kind === 'int4' &&
+    (t.name.startsWith('blocks.0.') || t.name === 'adaLN_modulation.1'));
+  const hi = Math.max(...block.map(t => t.offset_s + t.bytes_s));
+  const res = await fetch('int4.bin');
+  if (!res.ok) { row('int4.bin', `HTTP ${res.status}`, 'bad'); return; }
+  const bin = new Uint8Array(await res.arrayBuffer());
+  row('int4.bin', `${(bin.byteLength / 1e6).toFixed(1)} MB · block 0 需要前 ${(hi / 1e6).toFixed(1)} MB`,
+      bin.byteLength >= hi ? 'ok' : 'bad');
+
+  const buf = (data, usage) => {
+    const b = dev.createBuffer({ size: Math.max(16, data.byteLength), usage: usage | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(b, 0, data);
+    return b;
+  };
+  const half = (b) => {
+    const s = b & 0x8000 ? -1 : 1, e = (b >> 10) & 0x1f, m = b & 0x3ff;
+    return e === 0 ? s * m * 2 ** -24 : e === 31 ? NaN : s * (1 + m / 1024) * 2 ** (e - 15);
+  };
+  // 权重原样搬上 GPU：码值 u32 和 scale 都不动，反量化在内核里做
+  function packed(t) {
+    const q = new Uint32Array(bin.buffer, bin.byteOffset + t.offset_q, t.bytes_q / 4).slice();
+    const s16 = new Uint16Array(bin.buffer, bin.byteOffset + t.offset_s, t.bytes_s / 2);
+    const s = new Float32Array(s16.length);
+    for (let i = 0; i < s16.length; i++) s[i] = half(s16[i]);
+    return { q, s, n: t.n, k: t.k };
+  }
+  function dequant(q, s, n, k, rows = n) {
+    const W = new Float32Array(rows * k);
+    for (let r = 0; r < rows; r++) for (let kk = 0; kk < k; kk++) {
+      const word = q[r * (k / 8) + (kk >> 3)];
+      const code = (word >>> (4 * (kk & 7))) & 0xf;
+      W[r * k + kk] = (code - 8) * s[r * (k / 32) + (kk >> 5)];
+    }
+    return W;
+  }
+
+  const Variants = [[32, 64], [64, 64], [32, 128], [64, 128]];
+  const pipes = new Map();
+  for (const [tm, tn] of Variants) {
+    const code = wgsl(tm, tn);
+    const mod = dev.createShaderModule({ code });
+    const ci = await mod.getCompilationInfo();
+    const errs = ci.messages.filter(m => m.type === 'error');
+    if (errs.length) {
+      row(`shader ${tm}×${tn}`, `${errs.length} errors`, 'bad');
+      log(errs.map(e => `${e.lineNum}:${e.linePos} ${e.message}`).join('\n'));
+      continue;
+    }
+    pipes.set(`${tm}x${tn}`, dev.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } }));
+  }
+  row('shaders', `${pipes.size} 个变体编译通过`, pipes.size ? 'ok' : 'bad');
+
+  const dimsBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  async function runGEMM(t, TM, TN, aBuf, cBuf) {
+    const pipe = pipes.get(`${TM}x${TN}`);
+    dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([L, t.n, t.k, 0]));
+    const group = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: t.wq } },
+      { binding: 2, resource: { buffer: t.ws } }, { binding: 3, resource: { buffer: cBuf } },
+      { binding: 4, resource: { buffer: dimsBuf } },
+    ]});
+    const once = async () => {
+      const enc = dev.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(pipe); p.setBindGroup(0, group);
+      p.dispatchWorkgroups(Math.ceil(t.n / TN), Math.ceil(L / TM));
+      p.end();
+      dev.queue.submit([enc.finish()]);
+      await dev.queue.onSubmittedWorkDone();
+    };
+    await once();
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) { const t0 = performance.now(); await once(); best = Math.min(best, performance.now() - t0); }
+    return best;
+  }
+
+  /* ---- 先在真权重上验一次：M=8 行、N=64 行、K 全宽，CPU 算参考 */
+  {
+    const t = man.tensors.find(x => x.name === 'blocks.0.attn.qkv');
+    const p = packed(t);
+    // 只取前 64 行输出，K 全宽；打包布局按行连续，切起来正好
+    const q = p.q.slice(0, 64 * (t.k / 8));
+    const s = p.s.slice(0, 64 * (t.k / 32));
+    const W = dequant(q, s, 64, t.k, 64);
+    const M = 8;
+    const A = new Float32Array(M * t.k);
+    let seed = 3;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5;
+    for (let i = 0; i < A.length; i++) A[i] = rnd() * 0.1;
+
+    const aBuf = buf(A, GPUBufferUsage.STORAGE);
+    const cBuf = dev.createBuffer({ size: 4 * 64 * M, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const wq = buf(q, GPUBufferUsage.STORAGE);
+    const ws = buf(s, GPUBufferUsage.STORAGE);
+    const t2 = { wq, ws, n: 64, k: t.k };
+
+    // 复用计时函数，但 dispatch 用 M=8：把 L 换成 8 的临时版本
+    const pipe = pipes.get('32x64');
+    dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([M, 64, t.k, 0]));
+    const group = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: t2.wq } },
+      { binding: 2, resource: { buffer: t2.ws } }, { binding: 3, resource: { buffer: cBuf } },
+      { binding: 4, resource: { buffer: dimsBuf } },
+    ]});
+    const enc = dev.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe); pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(1, 1);
+    pass.end();
+    const rb = dev.createBuffer({ size: 4 * 64 * M, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(cBuf, 0, rb, 0, 4 * 64 * M);
+    dev.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+
+    let num = 0, ref = 0;
+    for (let m = 0; m < M; m++) for (let n = 0; n < 64; n++) {
+      let acc = 0;
+      for (let kk = 0; kk < t.k; kk++) acc += A[m * t.k + kk] * W[n * t.k + kk];
+      num = Math.max(num, Math.abs(acc - got[m * 64 + n]));
+      ref = Math.max(ref, Math.abs(acc));
+    }
+    const err = num / ref;
+    row('真权重对拍 M=8 N=64 K=1024', `max rel err ${err.toExponential(2)}`, err < 3e-2 ? 'ok' : 'bad');
+    // 出错时看一眼形状：是整行错、整列错，还是只有某些块错
+    const ref2 = (m, n) => {
+      let acc = 0;
+      for (let kk = 0; kk < t.k; kk++) acc += A[m * t.k + kk] * W[n * t.k + kk];
+      return acc;
+    };
+    const fmt = (f) => Array.from({ length: 4 }, (_, i) => f(i).toFixed(4)).join(' ');
+    log('want r0 ' + fmt((i) => ref2(0, i)) + ' | got r0 ' + fmt((i) => got[i]));
+    log('want r1 ' + fmt((i) => ref2(1, i)) + ' | got r1 ' + fmt((i) => got[64 + i]));
+    log('want r0c8 ' + fmt((i) => ref2(0, 8 + i)) + ' | got r0c8 ' + fmt((i) => got[8 + i]));
+  }
+
+  /* ---- 变体对比 + 真形状计时 */
+  const names = ['blocks.0.attn.qkv', 'blocks.0.attn.out', 'blocks.0.mlp.mlp.0', 'blocks.0.mlp.mlp.2'];
+  const best = new Map();
+
+  for (const [tm, tn] of Variants) {
+    if (!pipes.has(`${tm}x${tn}`)) continue;
+    for (const name of names) {
+      const t = man.tensors.find(x => x.name === name);
+      const p = packed(t);
+      const tq = { wq: buf(p.q, GPUBufferUsage.STORAGE), ws: buf(p.s, GPUBufferUsage.STORAGE), n: t.n, k: t.k };
+      if (p.q.length === 0) continue;
+      // 激活和输出按当前形状分配；最大的 mlp.2 要 201 MB + 50 MB
+      const A = new Float32Array(L * t.k);
+      for (let i = 0; i < A.length; i += 97) A[i] = ((i * 2654435761) % 1000) / 5000 - 0.1;
+      const aBuf = buf(A, GPUBufferUsage.STORAGE);
+      const cBuf = dev.createBuffer({ size: 4 * L * t.n, usage: GPUBufferUsage.STORAGE });
+      const ms = await runGEMM(tq, tm, tn, aBuf, cBuf);
+      const gf = (2 * L * t.n * t.k) / (ms * 1e6);
+      const key = name.replace('blocks.0.', '');
+      if (!best.has(key)) best.set(key, { name: key, n: t.n, k: t.k, ms, gf, cfg: `${tm}×${tn}` });
+      else if (ms < best.get(key).ms) best.set(key, { name: key, n: t.n, k: t.k, ms, gf, cfg: `${tm}×${tn}` });
+      row(`  ${tm}×${tn} · ${key}`, `${t.k}→${t.n} · ${ms.toFixed(1)} ms · ${gf.toFixed(0)} GFLOP/s`);
+      aBuf.destroy(); cBuf.destroy();
+    }
+  }
+
+  let sum = 0, sumGf = 0, flops = 0;
+  for (const v of best.values()) {
+    sum += v.ms; flops += 2 * L * v.n * v.k;
+    row(`best · ${v.name}`, `${v.k}→${v.n} · ${v.ms.toFixed(1)} ms · ${v.gf.toFixed(0)} GFLOP/s · ${v.cfg}`);
+  }
+  sumGf = flops / (sum * 1e6);
+  row('四个 GEMM 合计', `${sum.toFixed(0)} ms · ${sumGf.toFixed(0)} GFLOP/s（加权）`, 'ok');
+  row('note', 'attention 不在这张表里，用 block0.html 的同一条注意力时间加总');
+}
+
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>

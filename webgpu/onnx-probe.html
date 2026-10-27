@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>ONNX Runtime Web · WebGPU probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px 32px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 18px; font-size: 13px; max-width: 74ch; }
+  table { border-collapse: collapse; margin: 6px 0 14px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 4px 16px 4px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; } .dim { color: #9c9a92; }
+  #log { color: #9c9a92; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>ONNX Runtime Web · WebGPU probe</h1>
+<p class="sub">
+P0 的三个问题：int4（MatMulNBits）能不能落在 WebGPU 上、12294 token 的注意力物化要多少内存和时间、
+fp16 卷积在这条路径上跑多少 GFLOP/s。每张图都用 webgpu 和 wasm 各跑一次，
+两个数字一起看才知道有没有悄悄回退。
+</p>
+<table id="t"><tr><th>graph</th><th>result</th></tr></table>
+<div id="log"></div>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs';
+
+const $t = document.getElementById('t');
+const logEl = document.getElementById('log');
+const row = (k, v, cls) => {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+};
+const log = s => { logEl.textContent += s + '\n'; };
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
+try { ort.env.webgpu.powerPreference = 'high-performance'; } catch (e) {}
+
+const CASES = [
+  { name: 'mm_qkv',   file: 'onnx/mm_qkv_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 3072, note: 'int4 1024×3072' },
+  { name: 'mm_mlp',   file: 'onnx/mm_mlp_q4.onnx',  shape: { x: [1, 12294, 1024] }, flops: 2 * 12294 * 1024 * 4096, note: 'int4 1024×4096' },
+  { name: 'attn1h',   file: 'onnx/attn_1head.onnx', shape: { q: [1, 1, 12294, 64], k: [1, 1, 12294, 64], v: [1, 1, 12294, 64] }, flops: 4 * 12294 * 12294 * 64, note: '一个头，L=12294' },
+  { name: 'conv128',  file: 'onnx/conv128.onnx',    shape: { x: [1, 128, 128, 128] }, flops: 2 * 16384 * 128 * 128 * 9, note: 'fp32 3×3' },
+];
+
+async function bench(sess, feeds, rounds = 3) {
+  const names = sess.inputNames;
+  let best = Infinity, out = null;
+  for (let r = 0; r < rounds + 1; r++) {
+    const t0 = performance.now();
+    out = await sess.run(feeds);
+    const dt = performance.now() - t0;
+    if (r > 0) best = Math.min(best, dt);     // first round is the warm-up
+  }
+  return { ms: best, out };
+}
+
+async function main() {
+  if (!navigator.gpu) { row('WebGPU', '不可用', 'bad'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  row('adapter', [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join(' ') +
+      ` · shader-f16 ${adapter.features.has('shader-f16')}`, 'ok');
+  row('ort', ort.env.versions?.web || '?', 'dim');
+
+  for (const c of CASES) {
+    let bytes;
+    try {
+      const r = await fetch(c.file + '?n=' + Date.now());
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      bytes = new Uint8Array(await r.arrayBuffer());
+    } catch (e) {
+      row(c.name, '拉不到 ' + c.file + '（' + e.message + '）', 'bad');
+      continue;
+    }
+    const feeds = {};
+    for (const [k, s] of Object.entries(c.shape)) {
+      const n = s.reduce((a, b) => a * b, 1);
+      feeds[k] = new ort.Tensor('float32', (() => {
+        const a = new Float32Array(n);
+        let seed = 1;
+        for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; a[i] = seed / 0x7fffffff - 0.5; }
+        return a;
+      })(), s);
+    }
+
+    const line = [];
+    for (const ep of ['webgpu', 'wasm']) {
+      let sess;
+      try {
+        sess = await ort.InferenceSession.create(bytes, {
+          executionProviders: [ep],
+          graphOptimizationLevel: 'all',
+        });
+      } catch (e) {
+        line.push(`${ep} 建不了会话: ${String(e.message).slice(0, 80)}`);
+        continue;
+      }
+      try {
+        const { ms, out } = await bench(sess, Object.fromEntries(
+          Object.entries(feeds).map(([k, v]) => [k, v])));
+        const gflops = c.flops / (ms * 1e6);
+        line.push(`${ep} ${ms.toFixed(1)} ms (${gflops.toFixed(0)} GFLOP/s)`);
+      } catch (e) {
+        line.push(`${ep} 跑挂了: ${String(e.message).slice(0, 120)}`);
+      }
+      sess.release?.();
+    }
+    row(`${c.name} · ${c.note}`, line.join(' · '), line.some(l => l.includes('挂')) ? 'bad' : 'ok');
+    log(`  ${c.name}: ${bytes.length / 1e6} MB 图`);
+  }
+
+  row('对比基线', '手写 WGSL: int4 GEMM 1700 GFLOP/s · 融合 attention 1700 · 直接卷积 443', 'dim');
+}
+
+main().catch(e => { row('error', e.message, 'bad'); log(String(e.stack || e)); });
+</script>
+</body>
+</html>

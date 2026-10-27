@@ -1,0 +1,17 @@
+{
+  "format": "flip-int4",
+  "bits": 4,
+  "block_size": 32,
+  "axis": "K",
+  "symmetric": true,
+  "zero_point": 8,
+  "scale_dtype": "float16",
+  "nibble_order": "even k in the low nibble, odd k in the high nibble",
+  "quantized_modules": "nn.Linear only",
+  "kept_fp16": "norms, biases, embeddings, adaLN",
+  "tensor_naming": {
+    "weight": "<module>.weight  dtype U8  shape [n, k/2]",
+    "scale": "<module>.weight_scale  dtype F16  shape [n, k/32]"
+  },
+  "dequantize": "(code - 8) * scale, code = low nibble for even k, high nibble for odd k"
+}

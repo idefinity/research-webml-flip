@@ -1,0 +1,24 @@
+{
+  "model_type": "flip-student",
+  "architecture": "LatentSeqMMFlowModel",
+  "q_token_length": 8192,
+  "in_channels": 16,
+  "cam_channels": 5,
+  "out_channels": 16,
+  "model_channels": 1024,
+  "cond_channels": 1280,
+  "cond2_channels": 128,
+  "num_blocks": 24,
+  "num_refiner_blocks": 2,
+  "num_heads": 16,
+  "mlp_ratio": 4,
+  "qk_rms_norm": true,
+  "share_mod": true,
+  "use_shift_table": true,
+  "sampler": {
+    "steps": 2,
+    "shift": 1.0,
+    "guidance_scale": 1.0
+  },
+  "note": "guidance_scale <= 1 disables CFG. Do not run this student at the teacher's 50/3/7."
+}

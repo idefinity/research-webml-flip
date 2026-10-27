@@ -28,3 +28,8 @@ webgpu/manifest.json
 webgpu/int4.bin
 assets/k2n/*.bin
 .playwright-cli/
+
+# secrets
+key.secret
+*.secret
+dist/**/*.safetensors
