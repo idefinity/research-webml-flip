@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>端到端 · DiT 两步 + 八叉树 + 高斯</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 24px 28px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 16px; font-size: 13px; max-width: 78ch; }
+  table { border-collapse: collapse; margin: 6px 0 12px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 3px 16px 3px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; } .dim { color: #9c9a92; }
+  #out { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: #9c9a92; }
+  #view { width: 100%; height: 420px; border-radius: 10px; background: #0c0b09; margin-top: 12px; display: block; }
+  .cols { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<h1>端到端：DiT 两步 → 八叉树 → 65536 个高斯</h1>
+<p class="sub">
+这一页跑的是浏览器里真实存在的那半条管线：条件（DINO + VAE 的特征）从 Kaggle 那一跑的夹具里读，
+DiT 用 int4 的 ONNX 图在 WebGPU 上走两步，latent 交给八叉树循环和 ONNX 的解码器图，
+最后拼成高斯直接喂给渲染器。编码器那一半还没有浏览器能跑的图，所以条件是夹具，不是现场算的 ——
+这一点写在结果里，不藏在脚注里。
+</p>
+<table id="t"></table>
+<div id="out"></div>
+<canvas id="view"></canvas>
+
+<script type="module">
+import { hfFetch, HF_HOSTS } from '../site/src/hf.js';
+import { createSession, ort } from '../site/src/onnx.js';
+import { parseNPY } from '../site/src/npy.js';
+import { sampleOctree, buildGaussians } from '../site/src/decoder.js';
+import { acquireGPU } from '../site/src/gpu.js';
+import { createViewer } from '../site/src/viewer.js';
+
+const Q = new URLSearchParams(location.search);
+const LOCAL = Q.get('local') || '';            // ?local=/w/ 从本地目录读，绕开到不了的 HF
+const REPO_DIT = 'idefinity/flip-student-2step';
+const REPO_WEB = 'idefinity/flip-web';
+
+const $t = document.getElementById('t');
+const $o = document.getElementById('out');
+const rows = [];
+const row = (k, v, cls) => {
+  rows.push([k, v]);
+  window.__rows = rows;
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+};
+const log = (s) => { $o.textContent += s + '\n'; };
+
+// 本地模式只认文件名：localBase 后面接的就是 basename，
+// 仓库里的路径（k2u/、decoder/）在本地目录里是被压平的。
+const get = (repo, file, opts = {}) => hfFetch({
+  repo,
+  file: LOCAL ? file.replace(/.*\//, '') : file,
+  localBase: LOCAL || '',
+  ...opts,
+});
+
+const stat = (a, b) => {
+  let dot = 0, na = 0, nb = 0, d2 = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; d2 += (a[i] - b[i]) ** 2; }
+  return { cos: dot / (Math.sqrt(na) * Math.sqrt(nb) || 1), rel_l2: Math.sqrt(d2) / (Math.sqrt(nb) || 1) };
+};
+
+async function main() {
+  if (!navigator.gpu) { row('WebGPU', '不可用', 'bad'); return; }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  row('adapter', [adapter.info?.vendor, adapter.info?.architecture].filter(Boolean).join(' ') +
+      ` · shader-f16 ${adapter.features.has('shader-f16')}`, 'dim');
+  row('权重来源', LOCAL ? `本地 ${LOCAL}` : HF_HOSTS.join('  →  '), 'dim');
+
+  // ---- 1. 夹具：条件、噪声、Kaggle 那一跑的 latent
+  const fx = {};
+  for (const [name, file] of [
+    ['feature1', 'cond_feature1.npy'],
+    ['feature2', 'cond_feature2.npy'],
+    ['noiseLatent', 'noise_0.npy'],
+    ['noiseCamera', 'noise_1.npy'],
+    ['refLatent', 'latent2_latent.npy'],
+  ]) {
+    try {
+      const { bytes } = await get(REPO_WEB, 'k2u/' + file);
+      fx[name] = parseNPY(bytes.buffer);
+      row(`夹具 ${name}`, `${fx[name].shape.join('×')} · ${(bytes.length / 1e6).toFixed(1)} MB`, 'ok');
+    } catch (e) {
+      row(`夹具 ${name}`, String(e.message).slice(0, 90), 'bad');
+    }
+  }
+
+  // ---- 2. DiT
+  const t0 = performance.now();
+  const dit = await get(REPO_DIT, 'dit.int4.onnx', {
+    onProgress: (p) => { if (p.phase === 'download') log(`  ${p.host} ${(p.read / 1e6).toFixed(0)}/${(p.total / 1e6).toFixed(0)} MB ${p.rate.toFixed(1)} MB/s`); },
+  });
+  row('dit.int4.onnx', `${(dit.total / 1e6).toFixed(1)} MB · ${dit.secs.toFixed(1)} s · ${dit.rate.toFixed(1)} MB/s · ${dit.host}`, 'ok');
+
+  const sess = await createSession(dit.bytes, { label: 'dit' });
+  row('会话', `${sess.timing.createMs.toFixed(0)} ms · 输入 ${sess.inputs.join(',')} · 输出 ${sess.outputs.join(',')}`, 'dim');
+
+  const o = await ort();
+  const f1 = fx.feature1.data;                                   // [1,4101,1280]
+  const f2raw = fx.feature2.data.slice(5 * 128);                  // 夹具是补过 5 个零的，图要原始 4096
+  const f2 = new Float32Array(4096 * 128);
+  f2.set(f2raw.subarray ? f2raw.subarray(0, 4096 * 128) : f2raw.slice(0, 4096 * 128));
+  const camIn = new Float32Array(5);
+  camIn.set(fx.noiseCamera.data.subarray(0, 5));
+
+  let lat = new Float32Array(fx.noiseLatent.data);                // [8192*16]
+  let cam = camIn.slice();
+  const steps = [[1.0, 0.5], [0.5, 0.0]];
+  for (let s = 0; s < steps.length; s++) {
+    const [t, tPrev] = steps[s];
+    const dt = t - tPrev;
+    const tt = new Float32Array([1000 * t]);
+    const st = performance.now();
+    const out = await sess.run({
+      latent: new o.Tensor('float32', lat, [1, 8192, 16]),
+      camera: new o.Tensor('float32', cam, [1, 1, 5]),
+      feature1: new o.Tensor('float32', f1, [1, 4101, 1280]),
+      feature2: new o.Tensor('float32', f2, [1, 4096, 128]),
+      t: new o.Tensor('float32', tt, [1]),
+    });
+    const ms = performance.now() - st;
+    const vl = out.out_latent.data;
+    const vc = out.out_camera.data;
+    for (let i = 0; i < lat.length; i++) lat[i] -= vl[i] * dt;
+    for (let i = 0; i < cam.length; i++) cam[i] -= vc[i] * dt;
+    log(`  第 ${s + 1} 步 t=${t} dt=${dt} ${ms.toFixed(0)} ms  latent std ${std(lat).toFixed(3)}`);
+    row(`DiT 第 ${s + 1} 步`, `${ms.toFixed(0)} ms · ${(2 * 12294 * 1024 * 1024 * 24 * 2 / (ms * 1e6)).toFixed(0)} GFLOP/s 量级`, 'ok');
+  }
+
+  if (fx.refLatent) {
+    const r = stat(lat, fx.refLatent.data);
+    row('latent vs Kaggle', `cos ${r.cos.toFixed(4)} · rel_l2 ${r.rel_l2.toFixed(4)}`,
+        r.cos > 0.99 ? 'ok' : 'bad');
+  }
+
+  // ---- 3. 解码器
+  let meta = null, oct = null, gs = null;
+  try {
+    const m = await get(REPO_WEB, 'decoder/decoder_meta.json');
+    meta = JSON.parse(new TextDecoder().decode(m.bytes));
+    row('decoder_meta', `每点 ${meta.gaussians_per_point} 个高斯 · out_channels ${meta.out_channels}`, 'dim');
+    const a = await get(REPO_WEB, 'decoder/octree_level.int4.onnx');
+    oct = await createSession(a.bytes, { label: 'octree' });
+    const b = await get(REPO_WEB, 'decoder/gs.int4.onnx');
+    gs = await createSession(b.bytes, { label: 'gs' });
+    row('解码器图', `octree ${(a.total / 1e6).toFixed(1)} MB · gs ${(b.total / 1e6).toFixed(1)} MB`, 'ok');
+  } catch (e) {
+    row('解码器图', String(e.message).slice(0, 140), 'bad');
+  }
+
+  if (oct && gs && meta) {
+    const t1 = performance.now();
+    const { points, levels } = await sampleOctree({
+      session: oct, cond: lat, numPoints: 2048, level: 8, pad: 2048,
+      onLevel: (l) => log(`  第 ${l.level} 层 父体 ${l.parents} → 保留 ${l.kept} · ${l.ms.toFixed(0)} ms`),
+    });
+    row('八叉树 8 层', `${(performance.now() - t1).toFixed(0)} ms · 每层 ${(levels.reduce((a, l) => a + l.ms, 0) / 8).toFixed(0)} ms`, 'ok');
+
+    const t2 = performance.now();
+    const out = await gs.run({
+      x: new (await ort()).Tensor('float32', points, [1, 2048, 3]),
+      cond: new (await ort()).Tensor('float32', lat, [1, 8192, 16]),
+    });
+    const feats = out.features.data;
+    row('高斯头', `${(performance.now() - t2).toFixed(0)} ms · features ${feats.length / 2048} 通道/点`, 'ok');
+
+    const splat = buildGaussians({ features: feats, points, meta, numPoints: 2048 });
+    let op = 0, sc = 0;
+    for (let i = 0; i < splat.count; i++) { op += splat.data[i * 16 + 3]; sc += splat.data[i * 16 + 8]; }
+    row('高斯', `${splat.count} 个 · opacity 均值 ${(op / splat.count).toFixed(4)} · scale 均值 ${(sc / splat.count).toFixed(5)}`, 'ok');
+    row('包围盒', `x [${splat.min[0].toFixed(2)}, ${splat.max[0].toFixed(2)}] · y [${splat.min[1].toFixed(2)}, ${splat.max[1].toFixed(2)}] · z [${splat.min[2].toFixed(2)}, ${splat.max[2].toFixed(2)}]`, 'dim');
+
+    const gpu = await acquireGPU();
+    const viewer = await createViewer(gpu, document.getElementById('view'));
+    viewer.setSplat(splat);
+    row('渲染', '已上屏', 'ok');
+  }
+
+  row('总耗时', `${((performance.now() - t0) / 1000).toFixed(1)} s（含下载）`, 'dim');
+}
+
+function std(a) {
+  let m = 0;
+  for (let i = 0; i < a.length; i++) m += a[i];
+  m /= a.length;
+  let v = 0;
+  for (let i = 0; i < a.length; i++) v += (a[i] - m) ** 2;
+  return Math.sqrt(v / a.length);
+}
+
+main().then(() => { window.__done = true; document.title = 'READY'; })
+  .catch((e) => { row('error', e.message, 'bad'); log(String(e.stack || e)); window.__done = true; document.title = 'READY'; });
+</script>
+</body>
+</html>

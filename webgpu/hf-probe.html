@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>HF 取权重 · huggingface.co 与 hf-mirror.com</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 26px 30px; background: #14130f; color: #ecebe6;
+         font: 14px/1.65 ui-sans-serif, -apple-system, "PingFang SC", sans-serif; }
+  h1 { font-size: 17px; font-weight: 500; margin: 0 0 4px; }
+  p.sub { color: #9c9a92; margin: 0 0 18px; font-size: 13px; max-width: 76ch; }
+  table { border-collapse: collapse; margin: 6px 0 14px; font-variant-numeric: tabular-nums; }
+  td, th { padding: 4px 18px 4px 0; text-align: left; font-weight: 400; font-size: 13px; }
+  th { color: #9c9a92; }
+  .ok { color: #7fd18a; } .bad { color: #e57b6b; } .dim { color: #9c9a92; }
+  #out { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace;
+         font-size: 12px; color: #9c9a92; }
+</style>
+</head>
+<body>
+<h1>HF 取权重</h1>
+<p class="sub">
+应用要能自己把权重拉下来。这台机器到 huggingface.co 是 502，所以顺序是：先试官方域名，
+答不上来就换 hf-mirror.com。这一页把两个源各问一遍，报告谁给出了字节、多快、
+以及第二次读有没有落到 Cache API 里。大文件走并发 Range。
+</p>
+<table id="t"></table>
+<div id="out"></div>
+
+<script type="module">
+import { hfFetch, hfJSON, HF_HOSTS, resolveUrl } from '../site/src/hf.js';
+
+const $t = document.getElementById('t');
+const $o = document.getElementById('out');
+const rows = [];
+const row = (k, v, cls) => {
+  rows.push([k, v]);
+  window.__rows = rows;
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls || ''}">${v}</td>`;
+  $t.appendChild(tr);
+};
+const log = (s) => { $o.textContent += s + '\n'; };
+
+const REPO = 'idefinity/flip-student-2step';
+const BIG = 'dit.int4.onnx';
+
+async function main() {
+  row('源顺序', HF_HOSTS.join('  →  '), 'dim');
+  row('cache API', typeof caches !== 'undefined' ? '有' : '没有', 'dim');
+
+  // ---- 1. 小文件：两个源都能答，看谁先
+  let j;
+  try {
+    j = await hfJSON(REPO, 'config.json');
+    row('config.json', `${j.host} · ${j.bytes.length} B · sampler ${JSON.stringify(j.json.sampler)}`, 'ok');
+  } catch (e) {
+    row('config.json', String(e.message).slice(0, 160), 'bad');
+  }
+
+  // ---- 2. 逐源探针：把"官方域名答不上来"变成看得见的数字
+  for (const host of HF_HOSTS) {
+    const url = resolveUrl(host, REPO, BIG);
+    const t0 = performance.now();
+    try {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 6000);
+      const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: ctl.signal,
+                                   mode: 'cors', cache: 'no-store' });
+      clearTimeout(timer);
+      const cr = r.headers.get('content-range') || '';
+      const total = cr.includes('/') ? Number(cr.split('/').pop())
+        : Number(r.headers.get('content-length') || 0);
+      row(`探针 ${host}`, `${r.status} · ${(total / 1e6).toFixed(1)} MB · ` +
+          `${(performance.now() - t0).toFixed(0)} ms · accept-ranges ${r.headers.get('accept-ranges') || '-'}`,
+          r.ok || r.status === 206 ? 'ok' : 'bad');
+    } catch (e) {
+      row(`探针 ${host}`, `${(performance.now() - t0).toFixed(0)} ms 后失败: ${String(e.message).slice(0, 60)}`, 'bad');
+    }
+  }
+
+  // ---- 3. 大文件：并发 Range + 进度（?big=0 跳过，先只看源和探针）
+  const wantBig = new URLSearchParams(location.search).get('big') !== '0';
+  let last = 0;
+  let res;
+  if (!wantBig) row(BIG, '跳过（?big=0）', 'dim');
+  try {
+    if (!wantBig) throw new Error('skipped');
+    res = await hfFetch({
+      repo: REPO, file: BIG, parts: 8,
+      onProgress: (p) => {
+        const now = performance.now();
+        if (now - last < 400) return;
+        last = now;
+        log(`  ${p.host} ${p.phase} ${(p.read / 1e6).toFixed(0)}/${(p.total / 1e6).toFixed(0)} MB ` +
+            `${(p.p * 100).toFixed(0)}% ${p.rate.toFixed(1)} MB/s`);
+      },
+    });
+    row(BIG, `${res.host} · ${(res.total / 1e6).toFixed(1)} MB · ${res.secs.toFixed(1)} s · ` +
+        `${res.rate.toFixed(1)} MB/s · 并发 ${res.ranged ? '是' : '否'}`, 'ok');
+  } catch (e) {
+    row(BIG, String(e.message).slice(0, 200), 'bad');
+  }
+
+  // ---- 4. 第二次读：应该从 Cache API 出来
+  if (res) {
+    const t0 = performance.now();
+    try {
+      const again = await hfFetch({ repo: REPO, file: BIG });
+      const secs = (performance.now() - t0) / 1000;
+      row('第二次读', `${again.fromCache ? 'cache 命中' : '又下了一遍'} · ${secs.toFixed(1)} s · ` +
+          `${(again.total / 1e6).toFixed(1)} MB`, again.fromCache ? 'ok' : 'bad');
+    } catch (e) {
+      row('第二次读', String(e.message).slice(0, 160), 'bad');
+    }
+  }
+
+  // ---- 5. 前 4 个字节必须是 ONNX 能认的东西（ir_version 之类）
+  if (res && res.bytes.length > 16) {
+    row('字节抽查', [...res.bytes.slice(0, 8)].map(b => b.toString(16).padStart(2, '0')).join(' '), 'dim');
+  }
+}
+
+main().then(() => { window.__done = true; document.title = 'READY'; })
+  .catch((e) => { row('error', e.message, 'bad'); log(String(e.stack || e)); window.__done = true; document.title = 'READY'; });
+</script>
+</body>
+</html>
