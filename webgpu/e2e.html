@@ -95,8 +95,15 @@ async function main() {
     }
   }
 
-  // ---- 2. DiT
+  // ---- 2. DiT（?skipdit=1 时跳过，直接用夹具里的 latent 喂解码器 ——
+  //      注意力被物化成 9.66 GB，ORT-web 跑不动，见 PUBLISH.md 第二节）
+  const SKIP_DIT = Q.get('skipdit') === '1';
   const t0 = performance.now();
+  let lat = null;
+  if (SKIP_DIT && fx.refLatent) {
+    lat = new Float32Array(fx.refLatent.data);
+    row('DiT', '跳过（?skipdit=1），latent 用夹具里 Kaggle 那一跑的结果', 'dim');
+  } else {
   const dit = await get(REPO_DIT, 'dit.int4.onnx', {
     onProgress: (p) => { if (p.phase === 'download') log(`  ${p.host} ${(p.read / 1e6).toFixed(0)}/${(p.total / 1e6).toFixed(0)} MB ${p.rate.toFixed(1)} MB/s`); },
   });
@@ -113,8 +120,8 @@ async function main() {
   const camIn = new Float32Array(5);
   camIn.set(fx.noiseCamera.data.subarray(0, 5));
 
-  let lat = new Float32Array(fx.noiseLatent.data);                // [8192*16]
-  let cam = camIn.slice();
+  lat = new Float32Array(fx.noiseLatent.data);                    // [8192*16]
+  const cam = camIn.slice();
   const steps = [[1.0, 0.5], [0.5, 0.0]];
   for (let s = 0; s < steps.length; s++) {
     const [t, tPrev] = steps[s];
@@ -137,10 +144,11 @@ async function main() {
     row(`DiT 第 ${s + 1} 步`, `${ms.toFixed(0)} ms · ${(2 * 12294 * 1024 * 1024 * 24 * 2 / (ms * 1e6)).toFixed(0)} GFLOP/s 量级`, 'ok');
   }
 
-  if (fx.refLatent) {
+  if (fx.refLatent && !SKIP_DIT) {
     const r = stat(lat, fx.refLatent.data);
     row('latent vs Kaggle', `cos ${r.cos.toFixed(4)} · rel_l2 ${r.rel_l2.toFixed(4)}`,
         r.cos > 0.99 ? 'ok' : 'bad');
+  }
   }
 
   // ---- 3. 解码器
@@ -178,6 +186,12 @@ async function main() {
     let op = 0, sc = 0;
     for (let i = 0; i < splat.count; i++) { op += splat.data[i * 16 + 3]; sc += splat.data[i * 16 + 8]; }
     row('高斯', `${splat.count} 个 · opacity 均值 ${(op / splat.count).toFixed(4)} · scale 均值 ${(sc / splat.count).toFixed(5)}`, 'ok');
+    log(`  points[0..2] ${points[0]} ${points[1]} ${points[2]} · feats[0..5] ` +
+        `${[...feats.slice(0, 6)].map((v) => v.toFixed(3)).join(' ')} · xyz[0..2] ` +
+        `${splat.data[0]} ${splat.data[1]} ${splat.data[2]} · pert[0] ${meta.points_offset_perturbation[0]}`);
+    let nan = 0;
+    for (let i = 0; i < splat.count; i++) if (!Number.isFinite(splat.data[i * 16])) nan++;
+    log(`  xyz 里不是有限数的: ${nan} / ${splat.count}`);
     row('包围盒', `x [${splat.min[0].toFixed(2)}, ${splat.max[0].toFixed(2)}] · y [${splat.min[1].toFixed(2)}, ${splat.max[1].toFixed(2)}] · z [${splat.min[2].toFixed(2)}, ${splat.max[2].toFixed(2)}]`, 'dim');
 
     const gpu = await acquireGPU();

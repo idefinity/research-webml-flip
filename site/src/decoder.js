@@ -163,7 +163,10 @@ export async function sampleOctree({
 export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
   const ng = meta.gaussians_per_point;
   const L = meta.layout;
-  const pert = meta.points_offset_perturbation;   // [ng, 3]
+  // JSON 里是 [[..3], ...ng]；直接按一维索引会拿到 undefined，然后把整团坐标
+  // 变成 NaN（第一次跑就是这样，包围盒是 ±Infinity 才露出来）
+  const rawPert = meta.points_offset_perturbation;
+  const pert = Array.isArray(rawPert[0]) ? rawPert.flat() : rawPert;
   const base = meta.base_offset_scale;
   const lr = meta.rep_config.lr;
   const perturbe = meta.rep_config.perturbe_size;
@@ -190,10 +193,12 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
       oy = Math.tanh(oy) * 0.5 * perturbe * os;
       oz = Math.tanh(oz) * 0.5 * perturbe * os;
 
-      // 上游 PLY 里那一步默认变换 [[1,0,0],[0,0,-1],[0,1,0]] → (x, z, -y)
-      const x = ox + px;
-      const y = oz + pz;
-      const z = -(oy + py);
+      // 两步都照着上游抄：_xyz 的 setter 先按 aabb=[-0.5,-0.5,-0.5,1,1,1]
+      // 平移（xyz = v*1 + (-0.5)），save_ply 再套默认变换 [[1,0,0],[0,0,-1],[0,1,0]]
+      // → (x, z, -y)。少了平移，整团会坐在 (0.5, 0.5, -0.5) 而不是原点。
+      const x = ox + px - 0.5;
+      const y = oz + pz - 0.5;
+      const z = 0.5 - (oy + py);
 
       if (x < min[0]) min[0] = x;
       if (y < min[1]) min[1] = y;
