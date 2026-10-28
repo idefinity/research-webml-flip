@@ -177,7 +177,10 @@ try:
             self.m = m
 
         def forward(self, x, cond):
-            return self.m(x=x, cond=cond)["features"]
+            # x is a dict upstream: FixedlenDecoder reads x["points"]. A tensor
+            # fails with "too many indices for tensor of dimension 3", which is
+            # what the first run did.
+            return self.m(x={"points": x}, cond=cond)["features"]
 
     head = GsHead(gs).eval()
     NTOK = 2048
