@@ -19,9 +19,16 @@
 | 编码器（DINO / VAE / 抠图） | 未开始 | DINOv3 ViT-H 840 M，必须先蒸馏才可能进浏览器 |
 | 权重分发 | 可用 | 仓已公开；浏览器先试 huggingface.co，失败换 hf-mirror.com |
 
+**解码那一半已经在浏览器里跑通了**（`webgpu/e2e.html`，metal-3，用 Kaggle 那一跑的
+latent 当输入）：八叉树 8 层 3.87 s + 高斯头 2.43 s = 6.3 s，出 65536 个高斯，
+opacity 0.4213 / scale 0.00581 / bbox x[-0.25, 0.30] —— 和 Kaggle 上同一个 latent
+解出来的 PLY（opacity 0.392–0.420、bbox x[-0.254, 0.302]）对得上，差异落在解码器
+自己那 4 次解码的散布里。
+
 **下一步只有一件事**：把 DiT 的注意力从 ONNX 图里拿掉
 （`com.microsoft::Attention` 实测 1023 GFLOP/s，或切图 + 我们的 WGSL 1789 GFLOP/s）。
-做完这一步，浏览器里的"采样 → 解码 → 65K 高斯"就能连起来。
+做完这一步，浏览器里的"采样 → 解码 → 65K 高斯"就能连起来；
+再往后才是编码器（DINOv3 840 M 必须先蒸馏）。
 
 ---
 
