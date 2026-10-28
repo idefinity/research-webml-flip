@@ -8,6 +8,23 @@
 
 ---
 
+## 零、2026-10-28 的实际位置（数字都是量出来的）
+
+| 段 | 状态 | 证据 |
+|---|---|---|
+| DiT 蒸馏 + int4 | **完成** | 2 步 4.03 s（T4）；发布的 safetensors 反量化回模型 0 missing / 0 unexpected |
+| DiT 端到端出 PLY | **完成** | 65536 个高斯；latent vs 教师 20 步 cos 0.684（fp32 学生 0.682） |
+| 解码器 ONNX | 导出完成 | octree 一层（静态 2048，padding 免费）+ 高斯头 int4 150 MB |
+| DiT 在浏览器里跑 | **卡住** | 注意力物化 [1,16,12294,12294] fp32 = 9.66 GB，ORT-web 整数溢出 |
+| 编码器（DINO / VAE / 抠图） | 未开始 | DINOv3 ViT-H 840 M，必须先蒸馏才可能进浏览器 |
+| 权重分发 | 可用 | 仓已公开；浏览器先试 huggingface.co，失败换 hf-mirror.com |
+
+**下一步只有一件事**：把 DiT 的注意力从 ONNX 图里拿掉
+（`com.microsoft::Attention` 实测 1023 GFLOP/s，或切图 + 我们的 WGSL 1789 GFLOP/s）。
+做完这一步，浏览器里的"采样 → 解码 → 65K 高斯"就能连起来。
+
+---
+
 ## 一、每一段要动什么
 
 我们量过每一段在这块 GPU 上的时间（`webgpu/budget.html`，Apple M 系列）：
@@ -111,8 +128,14 @@ shader-f16 有）：
 代价：仓库里跑着两个运行时。交接靠 `preferredOutputLocation: 'gpu-buffer'`，
 ORT-web 既支持把输出留在显存，也支持直接吃显存输入。
 
-**还没量的**：fp16 激活（q4f16）那一档，和 `com.microsoft::Attention` 在 WebGPU 上有没有
-融合核（P0 v8 正在跑）。如果融合核存在，第 2 条可以推翻。
+**还没量的**：fp16 激活（q4f16）那一档。
+
+**已经量到的（2026-10-28，浏览器里）**：`dit.int4.onnx` 在 ORT-web 上 2.5 s 建好会话，
+输入名对得上，然后 `OrtRun` 死在 **SafeInt 整数溢出** —— 注意力被物化成
+`[1, 16, 12294, 12294]` fp32 = **9.66 GB**。第 2 条不是"慢"这一层的问题，是**跑不起来**。
+能跑的两条路：`com.microsoft::Attention`（实测 12294 token / 16 头能在 WebGPU 上跑完，
+1023 GFLOP/s），或者切图 + 我们自己的 WGSL（1789 GFLOP/s）。二选一之前，DiT 在浏览器里
+是走不通的。
 
 ---
 
