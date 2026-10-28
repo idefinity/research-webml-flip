@@ -169,6 +169,12 @@ try:
                           output_names=["logits"],
                           opset_version=17, dynamo=False)
     p("octree fp32", round(fp_oct.stat().st_size / 1e6, 1), "MB", ops_hist(str(fp_oct)))
+    import onnx as _onnx
+
+    _m = _onnx.load(str(fp_oct))
+    R["graphs"]["octree_level"] = {"inputs": [(i.name, [d.dim_value or d.dim_param for d in i.type.tensor_type.shape.dim]) for i in _m.graph.input],
+                                   "outputs": [(o.name, [d.dim_value or d.dim_param for d in o.type.tensor_type.shape.dim]) for o in _m.graph.output]}
+    p("octree io", json.dumps(R["graphs"]["octree_level"]))
 
     # ---------------- gaussian head: 2048 tokens, static --------------------
     class GsHead(nn.Module):
@@ -222,6 +228,11 @@ try:
     def parity(fp, q4, feeds, out_name):
         o1 = ort.InferenceSession(str(fp), providers=["CPUExecutionProvider"])
         o2 = ort.InferenceSession(str(q4), providers=["CPUExecutionProvider"])
+        # an input the graph never uses is dropped by the exporter, so feed only
+        # what the graph actually declares (l2 goes away when the level embedder
+        # has no second branch)
+        want = {i.name for i in o1.get_inputs()}
+        feeds = {k: v for k, v in feeds.items() if k in want}
         t0 = time.time()
         a = o1.run(None, feeds)[0]
         t1 = time.time()
