@@ -135,8 +135,18 @@ try:
         def forward(self, x, l, cond, l2):
             return self.m(x, l, cond, l2)["logits"]
 
+    # Static at the longest token count the loop can ever ask for, and padded:
+    # the octree transformer is cross-only (ModulatedTransformerCrossOnlyBlock
+    # has no self-attention - every token sees the conditioning and nothing
+    # else), so a token's output does not depend on its neighbours and padding
+    # the parent list with junk cannot change the rows we do use. That buys a
+    # graph with no dynamic axis, which the exporter insists on:
+    # x.reshape(-1,3).reshape(B,L,-1) turns B and L into Gather nodes under
+    # dynamic_axes and the export dies with "ListConstruct is not constant".
+    # A dynamic export was tried first and failed exactly there.
+    NTOK_OCT = 2048
     oct = OctreeLevel(dec.octree).eval()
-    x = torch.randn(1, 8, 3)
+    x = torch.randn(1, NTOK_OCT, 3)
     l = torch.tensor([4], dtype=torch.long)        # res = 2**level, level 2 here
     cond = torch.randn(1, 8192, 16)
     l2 = torch.tensor([2048], dtype=torch.long)    # num_points
@@ -144,12 +154,19 @@ try:
         ref = oct(x, l, cond, l2)
     p("octree ref logits", tuple(ref.shape))
 
+    # the padding claim above is a claim until it is measured: the first 8 rows
+    # of a 2048-row run must equal a run of those 8 rows alone
+    with torch.no_grad():
+        few = oct(x[:, :8].clone(), l, cond, l2)
+    pad_err = float((few - ref[:, :8]).abs().max())
+    p("padding check: 8 rows alone vs inside 2048, max|diff| =", pad_err)
+    R["padding_max_abs"] = pad_err
+
     fp_oct = OUT / "octree_level.fp32.onnx"
     with torch.no_grad():
         torch.onnx.export(oct, (x, l, cond, l2), str(fp_oct),
                           input_names=["x", "l", "cond", "l2"],
                           output_names=["logits"],
-                          dynamic_axes={"x": {1: "L"}, "logits": {1: "L"}},
                           opset_version=17, dynamo=False)
     p("octree fp32", round(fp_oct.stat().st_size / 1e6, 1), "MB", ops_hist(str(fp_oct)))
 
@@ -236,7 +253,6 @@ try:
     with torch.no_grad():
         torch.onnx.export(head, (xs, cs), str(short),
                           input_names=["x", "cond"], output_names=["features"],
-                          dynamic_axes={"x": {1: "L"}, "features": {1: "L"}},
                           opset_version=17, dynamo=False)
     quant(short, OUT / "gs_short.int4.onnx")
     R["graphs"]["gs"]["parity_64tok"] = parity(
@@ -248,7 +264,7 @@ try:
     api = HfApi(token=HF_TOKEN)
     api.create_repo(TARGET, private=False, exist_ok=True, repo_type="model")
     for f in sorted(OUT.glob("*")):
-        if f.suffix in (".onnx", ".json") and "short" not in f.name and "fp32" not in f.name:
+        if f.suffix in (".onnx", ".json", ".txt") and "short" not in f.name and "fp32" not in f.name:
             api.upload_file(path_or_fileobj=str(f), path_in_repo=f"decoder/{f.name}",
                             repo_id=TARGET, repo_type="model")
             p("uploaded", f.name, round(f.stat().st_size / 1e6, 2), "MB")
