@@ -1,0 +1,458 @@
+{
+  "rows": [
+    {
+      "image": "building_stone_house.webp",
+      "index": 0,
+      "seed": 42,
+      "t_first": 1000.0,
+      "t_last": 136.38,
+      "t20": {
+        "n": 65536,
+        "opacity": 0.9321,
+        "shell": 0.9623,
+        "r95": 0.6005,
+        "r50": 0.43,
+        "mean_scale": 0.00621,
+        "ply": "building_stone_house_t20.ply",
+        "mb": 4.46,
+        "decode_s": 1.1,
+        "latent": {
+          "cos": 1.0,
+          "rel_l2": 0.0
+        }
+      },
+      "t04": {
+        "n": 65536,
+        "opacity": 0.8351,
+        "shell": 0.9484,
+        "r95": 0.6157,
+        "r50": 0.4275,
+        "mean_scale": 0.00667,
+        "ply": "building_stone_house_t04.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.8022,
+          "rel_l2": 0.6228
+        },
+        "r95_ratio": 1.025,
+        "gate": true
+      },
+      "g04": {
+        "n": 65536,
+        "opacity": 0.2493,
+        "shell": 0.4048,
+        "r95": 0.5926,
+        "r50": 0.4268,
+        "mean_scale": 0.02186,
+        "ply": "building_stone_house_g04.ply",
+        "mb": 4.46,
+        "decode_s": 0.74,
+        "latent": {
+          "cos": 0.7717,
+          "rel_l2": 0.6363
+        },
+        "r95_ratio": 0.987,
+        "gate": false
+      },
+      "s04_e002": {
+        "n": 65536,
+        "opacity": 0.9522,
+        "shell": 0.9516,
+        "r95": 0.5971,
+        "r50": 0.4217,
+        "mean_scale": 0.00691,
+        "ply": "building_stone_house_s04_e002.ply",
+        "mb": 4.46,
+        "decode_s": 0.7,
+        "latent": {
+          "cos": 0.7573,
+          "rel_l2": 0.6787
+        },
+        "r95_ratio": 0.994,
+        "gate": true
+      },
+      "s04_e004": {
+        "n": 65536,
+        "opacity": 0.9233,
+        "shell": 0.9426,
+        "r95": 0.6118,
+        "r50": 0.4386,
+        "mean_scale": 0.00718,
+        "ply": "building_stone_house_s04_e004.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.6882,
+          "rel_l2": 0.7652
+        },
+        "r95_ratio": 1.019,
+        "gate": true
+      },
+      "s04_e006": {
+        "n": 65536,
+        "opacity": 0.9428,
+        "shell": 0.9702,
+        "r95": 0.5925,
+        "r50": 0.4107,
+        "mean_scale": 0.00621,
+        "ply": "building_stone_house_s04_e006.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.689,
+          "rel_l2": 0.7658
+        },
+        "r95_ratio": 0.987,
+        "gate": true
+      }
+    },
+    {
+      "image": "creature_butterfly.webp",
+      "index": 1,
+      "seed": 43,
+      "t_first": 1000.0,
+      "t_last": 136.38,
+      "t20": {
+        "n": 65536,
+        "opacity": 0.713,
+        "shell": 0.9594,
+        "r95": 0.6283,
+        "r50": 0.3703,
+        "mean_scale": 0.00568,
+        "ply": "creature_butterfly_t20.ply",
+        "mb": 4.46,
+        "decode_s": 0.84,
+        "latent": {
+          "cos": 1.0,
+          "rel_l2": 0.0
+        }
+      },
+      "t04": {
+        "n": 65536,
+        "opacity": 0.5778,
+        "shell": 0.8052,
+        "r95": 0.6405,
+        "r50": 0.3988,
+        "mean_scale": 0.00831,
+        "ply": "creature_butterfly_t04.ply",
+        "mb": 4.46,
+        "decode_s": 0.72,
+        "latent": {
+          "cos": 0.7868,
+          "rel_l2": 0.6317
+        },
+        "r95_ratio": 1.019,
+        "gate": false
+      },
+      "g04": {
+        "n": 65536,
+        "opacity": 0.0446,
+        "shell": 0.104,
+        "r95": 0.5932,
+        "r50": 0.3944,
+        "mean_scale": 0.01953,
+        "ply": "creature_butterfly_g04.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.6403,
+          "rel_l2": 0.7722
+        },
+        "r95_ratio": 0.944,
+        "gate": false
+      },
+      "s04_e002": {
+        "n": 65536,
+        "opacity": 0.8213,
+        "shell": 0.9842,
+        "r95": 0.623,
+        "r50": 0.3764,
+        "mean_scale": 0.00562,
+        "ply": "creature_butterfly_s04_e002.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.8002,
+          "rel_l2": 0.6238
+        },
+        "r95_ratio": 0.992,
+        "gate": true
+      },
+      "s04_e004": {
+        "n": 65536,
+        "opacity": 0.8441,
+        "shell": 0.9886,
+        "r95": 0.6128,
+        "r50": 0.3812,
+        "mean_scale": 0.00565,
+        "ply": "creature_butterfly_s04_e004.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.7669,
+          "rel_l2": 0.6696
+        },
+        "r95_ratio": 0.975,
+        "gate": true
+      },
+      "s04_e006": {
+        "n": 65536,
+        "opacity": 0.8248,
+        "shell": 0.986,
+        "r95": 0.6172,
+        "r50": 0.3734,
+        "mean_scale": 0.00549,
+        "ply": "creature_butterfly_s04_e006.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.7485,
+          "rel_l2": 0.6977
+        },
+        "r95_ratio": 0.982,
+        "gate": true
+      }
+    },
+    {
+      "image": "plant_water_lily.webp",
+      "index": 2,
+      "seed": 44,
+      "t_first": 1000.0,
+      "t_last": 136.38,
+      "t20": {
+        "n": 65536,
+        "opacity": 0.9616,
+        "shell": 0.9881,
+        "r95": 0.5012,
+        "r50": 0.3149,
+        "mean_scale": 0.00632,
+        "ply": "plant_water_lily_t20.ply",
+        "mb": 4.46,
+        "decode_s": 0.74,
+        "latent": {
+          "cos": 1.0,
+          "rel_l2": 0.0
+        }
+      },
+      "t04": {
+        "n": 65536,
+        "opacity": 0.8402,
+        "shell": 0.9701,
+        "r95": 0.5032,
+        "r50": 0.3113,
+        "mean_scale": 0.00687,
+        "ply": "plant_water_lily_t04.ply",
+        "mb": 4.46,
+        "decode_s": 0.7,
+        "latent": {
+          "cos": 0.9403,
+          "rel_l2": 0.3419
+        },
+        "r95_ratio": 1.004,
+        "gate": true
+      },
+      "g04": {
+        "n": 65536,
+        "opacity": 0.143,
+        "shell": 0.3575,
+        "r95": 0.5042,
+        "r50": 0.3376,
+        "mean_scale": 0.01298,
+        "ply": "plant_water_lily_g04.ply",
+        "mb": 4.46,
+        "decode_s": 0.7,
+        "latent": {
+          "cos": 0.8789,
+          "rel_l2": 0.4782
+        },
+        "r95_ratio": 1.006,
+        "gate": false
+      },
+      "s04_e002": {
+        "n": 65536,
+        "opacity": 0.9795,
+        "shell": 0.9771,
+        "r95": 0.5049,
+        "r50": 0.324,
+        "mean_scale": 0.00684,
+        "ply": "plant_water_lily_s04_e002.ply",
+        "mb": 4.46,
+        "decode_s": 0.7,
+        "latent": {
+          "cos": 0.9087,
+          "rel_l2": 0.4301
+        },
+        "r95_ratio": 1.007,
+        "gate": true
+      },
+      "s04_e004": {
+        "n": 65536,
+        "opacity": 0.9866,
+        "shell": 0.9903,
+        "r95": 0.4978,
+        "r50": 0.3152,
+        "mean_scale": 0.00635,
+        "ply": "plant_water_lily_s04_e004.ply",
+        "mb": 4.46,
+        "decode_s": 0.71,
+        "latent": {
+          "cos": 0.9302,
+          "rel_l2": 0.3707
+        },
+        "r95_ratio": 0.993,
+        "gate": true
+      },
+      "s04_e006": {
+        "n": 65536,
+        "opacity": 0.9503,
+        "shell": 0.9916,
+        "r95": 0.4871,
+        "r50": 0.303,
+        "mean_scale": 0.00603,
+        "ply": "plant_water_lily_s04_e006.ply",
+        "mb": 4.46,
+        "decode_s": 0.75,
+        "latent": {
+          "cos": 0.9573,
+          "rel_l2": 0.2906
+        },
+        "r95_ratio": 0.972,
+        "gate": true
+      }
+    },
+    {
+      "image": "vehicle_pirate_ship.webp",
+      "index": 3,
+      "seed": 45,
+      "t_first": 1000.0,
+      "t_last": 136.38,
+      "t20": {
+        "n": 65536,
+        "opacity": 0.9031,
+        "shell": 0.9901,
+        "r95": 0.4908,
+        "r50": 0.3241,
+        "mean_scale": 0.00462,
+        "ply": "vehicle_pirate_ship_t20.ply",
+        "mb": 4.46,
+        "decode_s": 0.74,
+        "latent": {
+          "cos": 1.0,
+          "rel_l2": 0.0
+        }
+      },
+      "t04": {
+        "n": 65536,
+        "opacity": 0.852,
+        "shell": 0.9776,
+        "r95": 0.4929,
+        "r50": 0.3308,
+        "mean_scale": 0.00519,
+        "ply": "vehicle_pirate_ship_t04.ply",
+        "mb": 4.46,
+        "decode_s": 0.73,
+        "latent": {
+          "cos": 0.8087,
+          "rel_l2": 0.6042
+        },
+        "r95_ratio": 1.004,
+        "gate": true
+      },
+      "g04": {
+        "n": 65536,
+        "opacity": 0.143,
+        "shell": 0.2949,
+        "r95": 0.475,
+        "r50": 0.3292,
+        "mean_scale": 0.01293,
+        "ply": "vehicle_pirate_ship_g04.ply",
+        "mb": 4.46,
+        "decode_s": 0.73,
+        "latent": {
+          "cos": 0.7242,
+          "rel_l2": 0.691
+        },
+        "r95_ratio": 0.968,
+        "gate": false
+      },
+      "s04_e002": {
+        "n": 65536,
+        "opacity": 0.9116,
+        "shell": 0.9858,
+        "r95": 0.4936,
+        "r50": 0.3263,
+        "mean_scale": 0.00517,
+        "ply": "vehicle_pirate_ship_s04_e002.ply",
+        "mb": 4.46,
+        "decode_s": 0.8,
+        "latent": {
+          "cos": 0.8792,
+          "rel_l2": 0.486
+        },
+        "r95_ratio": 1.006,
+        "gate": true
+      },
+      "s04_e004": {
+        "n": 65536,
+        "opacity": 0.8985,
+        "shell": 0.9882,
+        "r95": 0.4918,
+        "r50": 0.3283,
+        "mean_scale": 0.0049,
+        "ply": "vehicle_pirate_ship_s04_e004.ply",
+        "mb": 4.46,
+        "decode_s": 0.85,
+        "latent": {
+          "cos": 0.9107,
+          "rel_l2": 0.4172
+        },
+        "r95_ratio": 1.002,
+        "gate": true
+      },
+      "s04_e006": {
+        "n": 65536,
+        "opacity": 0.899,
+        "shell": 0.99,
+        "r95": 0.4884,
+        "r50": 0.3218,
+        "mean_scale": 0.00438,
+        "ply": "vehicle_pirate_ship_s04_e006.ply",
+        "mb": 4.46,
+        "decode_s": 0.75,
+        "latent": {
+          "cos": 0.8576,
+          "rel_l2": 0.5298
+        },
+        "r95_ratio": 0.995,
+        "gate": true
+      }
+    }
+  ],
+  "summary": {
+    "t04": {
+      "n": 4,
+      "opacity": 0.776,
+      "shell": 0.925,
+      "gate": "3/4"
+    },
+    "g04": {
+      "n": 4,
+      "opacity": 0.145,
+      "shell": 0.29,
+      "gate": "0/4"
+    },
+    "s04_e006": {
+      "n": 4,
+      "opacity": 0.904,
+      "shell": 0.984,
+      "gate": "4/4"
+    }
+  },
+  "checkpoints": [
+    "student_e002.pt",
+    "student_e004.pt",
+    "student_e006.pt"
+  ],
+  "scripts_sha": "ac72202"
+}
