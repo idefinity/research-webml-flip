@@ -30,6 +30,10 @@ Env:
   FLIP_TRACE_STEPS teacher steps (default 20)
   FLIP_TRACE_GAIN  guidance scale (default 3.0, the pipeline default)
   FLIP_TRACE_SHIFT flow schedule shift (default 3.0)
+  FLIP_TRACE_COND  "teacher" (default) | "student" - record the browser's own
+                   29.97 M encoders' features instead of DINOv3 + Flux2 VAE, so
+                   the distilled DiT sees the conditions it will be run with
+                   (needs FLIP_K3 and the k3 weights on disk)
   FLIP_SHARD       "i/n" - trace one shard, see above
   FLIP_FORK        "auto" (default) | "0" - two-GPU coordination on or off
   FLIP_FORK_MIN_GB refuse to fork below this much free RAM (default 16)
@@ -77,6 +81,13 @@ FETCH_TPL = os.environ.get(
     "FLIP_FETCH_TPL", "https://picsum.photos/seed/{s}/{size}").strip()
 FETCH_SIZE = int(os.environ.get("FLIP_FETCH_SIZE", "512"))
 SEED = 42
+# Which encoders fill `cond`. "teacher" is the reference features; "student"
+# records what the browser's own 29.97 M encoders produce, so the distilled DiT
+# is trained on the condition distribution it will actually be run with. Mixed
+# condition sources in one trace directory would be silent and ruinous, so the
+# mode is written into every trace file and checked by k2e.
+COND_MODE = os.environ.get("FLIP_TRACE_COND", "teacher").strip().lower()
+K3 = Path(os.environ.get("FLIP_K3", WORK / "k3_encoder_distill.py"))
 
 # Tensors below this size stay inline; above it they get deduplicated. cond
 # features are 4101x1280 and identical on every one of the 40 calls per image,
@@ -565,18 +576,70 @@ def build_pipeline():
     return pipe, flow
 
 
+_SFRONT = None
+
+
+def student_cond(image):
+    """The browser's own front end: matte -> erode -> square crop -> canvas.
+
+    Deliberately a byte-for-byte copy of what k4_compare.py does, because that
+    is the path whose fidelity to the teacher has actually been measured. Only
+    the three distilled encoders load here (29.97 M params), not the pipeline.
+    """
+    import importlib.util
+
+    import numpy as np
+    from torchvision import transforms
+
+    global _SFRONT
+    if _SFRONT is None:
+        spec = importlib.util.spec_from_file_location("k3", str(K3))
+        k3 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(k3)
+        _SFRONT = {
+            "k3": k3,
+            "dino": k3.load_weights(k3.build_dino(), "dino", DEV),
+            "vae": k3.load_weights(k3.build_vae(), "vae", DEV),
+            "matte": k3.load_weights(k3.build_matte(), "matte", DEV),
+        }
+    sf = _SFRONT
+    k3 = sf["k3"]
+    rgb = k3.resize_min_side(image)
+    x_in = transforms.ToTensor()(rgb).unsqueeze(0).to(DEV)
+    with torch.no_grad():
+        a = sf["matte"](x_in)[0, 0].float().cpu().numpy()
+    alpha = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+    box = k3.square_crop_box(np.array(k3.erode_alpha(alpha, 1), dtype=np.uint8))
+    rgba = rgb.convert("RGBA")
+    rgba.putalpha(Image.fromarray(alpha, "L"))
+    cropped = rgba.crop(box).resize((k3.CANVAS, k3.CANVAS), Image.LANCZOS)
+    canvas = Image.new("RGB", (k3.CANVAS, k3.CANVAS), (0, 0, 0))
+    canvas.paste(cropped, mask=cropped.split()[3])
+    x = transforms.ToTensor()(canvas).unsqueeze(0).to(DEV)
+    with torch.no_grad():
+        f1 = sf["dino"](x)
+        f2 = sf["vae"](x * 2 - 1)
+    # the teacher's VAE branch emits 5 extra leading tokens; the conv VAE does
+    # not, and the DiT's cross-attention length depends on it.
+    z = torch.zeros(f2.shape[0], 5, f2.shape[2], dtype=f2.dtype, device=f2.device)
+    return {"feature1": f1, "feature2": torch.cat([z, f2], dim=1)}, canvas
+
+
 def trace_one(pipe, flow, idx, img_path):
     """Trace one image. Returns its summary row, or None on failure."""
     rec = Recorder(flow)
     try:
         image = Image.open(img_path).convert("RGB")
-        prepared = pipe.preprocess_image(image)
+        if COND_MODE == "student":
+            cond, prepared = student_cond(image)
+        else:
+            prepared = pipe.preprocess_image(image)
+            gen = torch.Generator(device=DEV).manual_seed(SEED + idx)
+            cond = pipe.encode_image(prepared, generator=gen)
         try:
             prepared.save(OUT / f"prepared_{idx:04d}.png")
         except Exception:  # noqa: BLE001
             pass
-        gen = torch.Generator(device=DEV).manual_seed(SEED + idx)
-        cond = pipe.encode_image(prepared, generator=gen)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -593,6 +656,7 @@ def trace_one(pipe, flow, idx, img_path):
         shared = compact(rec.calls)
         payload = {
             "image": img_path.name,
+            "cond": COND_MODE,
             "steps": STEPS,
             "guidance": GAIN,
             "shift": SHIFT,

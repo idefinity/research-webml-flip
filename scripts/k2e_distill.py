@@ -32,6 +32,13 @@ The state is a dict: latent is [1, 8192, 16] and camera is [1, 1, 5], and the
 sampler integrates both. Both are advanced here, because freezing the camera
 would feed the student a state at steps 2..4 that the teacher never visited.
 
+The student is the teacher's own architecture, initialised from the teacher's
+own weights (`copy.deepcopy(teacher)`) and the same 370.5 M parameters. This run
+only cuts the number of denoising calls; it is not a size reduction, and the
+2-step int4 student that shipped before it is not a starting point - it is
+discarded. Quantisation, if wanted, is a packaging step afterwards (k2m/k2q) and
+is orthogonal to what is trained here.
+
 Writes k2e/student.pt, grid.json, and report.json.
 
 Env:
@@ -582,6 +589,15 @@ def main():
             note(f"  {f.name} unreadable")
             note(traceback.format_exc()[-600:])
     note(f"{len(traces)} loaded")
+
+    # The condition source is a property of the model being trained, not of the
+    # data: a DiT distilled on the small encoders' features and one distilled on
+    # DINOv3's are different functions of the same latent. Mixed traces would be
+    # averaged into a target that matches neither.
+    modes = sorted({str(tr.get("cond", "teacher")) for tr in traces})
+    note(f"condition source {modes}")
+    if len(modes) > 1:
+        raise RuntimeError(f"traces mix condition sources {modes}")
 
     first = traces[0]
     states, ts, final = trajectory(first)
