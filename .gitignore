@@ -1,6 +1,7 @@
 # local tool state - never published
 .cloudflare/
 .workbuddy/
+.opencode/
 .DS_Store
 
 # python
@@ -12,22 +13,21 @@ __pycache__/
 ckpts/
 *.safetensors
 *.onnx
+*.npy
 *.spline
 *.ply
 k0/
 k1/
 k2/
 fetched_script.py
+*artifacts.zip
 
 # playwright-cli scratch (console logs / page snapshots / screenshots)
 webgpu/.playwright-cli/
 .playwright-cli/
 webgpu/manifest.json
 webgpu/int4.bin
-webgpu/manifest.json
-webgpu/int4.bin
 assets/k2n/*.bin
-.playwright-cli/
 
 # secrets
 key.secret
@@ -36,3 +36,9 @@ dist/**/*.safetensors
 
 # local weights for offline browser runs
 w/
+
+# the jandan photos themselves; the URL manifest is in data/
+input_example/
+
+# exported PLYs and renders (large)
+out/
