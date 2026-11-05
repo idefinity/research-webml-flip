@@ -1,0 +1,190 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PLY gallery</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0b0c; color: #d8d8d2;
+    font: 13px/1.5 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+  body { display: flex; }
+  aside { width: 280px; min-width: 280px; height: 100%; overflow-y: auto;
+    border-right: 1px solid #26262a; background: #101012; }
+  aside header { padding: 12px 14px 10px; border-bottom: 1px solid #1e1e22; }
+  aside h1 { margin: 0 0 4px; font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+  aside p { margin: 0; color: #77777d; font-size: 11px; }
+  .row { display: flex; gap: 9px; align-items: center; padding: 7px 12px;
+    cursor: pointer; border-left: 2px solid transparent; }
+  .row:hover { background: #17171a; }
+  .row.on { background: #1b1b20; border-left-color: #7aa2ff; }
+  .row img { width: 38px; height: 38px; object-fit: cover; border-radius: 3px;
+    background: #000; flex: 0 0 auto; }
+  .row .nophoto { width: 38px; height: 38px; border-radius: 3px; background: #1a1a1e;
+    flex: 0 0 auto; }
+  .row .meta { min-width: 0; }
+  .row .name { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .sub { font-size: 10.5px; color: #7c7c83; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  main { flex: 1; position: relative; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  canvas.drag { cursor: grabbing; }
+  #hud { position: absolute; left: 16px; bottom: 14px; font-size: 11.5px; color: #8a8a92;
+    pointer-events: none; }
+  #hud b { color: #d8d8d2; font-weight: 600; }
+  #tip { position: absolute; right: 16px; bottom: 14px; font-size: 11px; color: #5d5d64; }
+  #err { position: absolute; inset: 0; display: none; place-content: center; padding: 40px;
+    color: #ff9b9b; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+    white-space: pre-wrap; }
+</style>
+<aside>
+  <header>
+    <h1 id="title">PLY gallery</h1>
+    <p id="count"></p>
+  </header>
+  <div id="list"></div>
+</aside>
+<main>
+  <canvas id="c"></canvas>
+  <div id="hud"></div>
+  <div id="tip">拖动旋转 · 滚轮缩放 · ← → 切换 · 空格暂停自转</div>
+  <div id="err"></div>
+</main>
+<script type="module">
+// 看一堆 PLY 用的：左边列表，右边一个能转的球。
+//
+//   ply-gallery.html?manifest=../out/teacher-2026-10-29/manifest.json
+//
+// 站点自己的 viewer 只管出图、不带鼠标交互（展台式自转），所以拖拽和滚轮在这里
+// 直接改 viewer.cam，再 redraw —— 不进 viewer.js，免得把那边的"自动播放"弄复杂。
+// 翻正（模型是 Y 向下）在 viewer.setSplat 里做，这里不用管。
+
+import { acquireGPU } from './src/gpu.js';
+import { createViewer } from './src/viewer.js';
+import { loadPLY } from './src/ply.js';
+
+const q = new URLSearchParams(location.search);
+const root = q.get('root') ?? '../';
+const manifestUrl = q.get('manifest') ?? '../out/teacher-2026-10-29/manifest.json';
+
+const cv = document.getElementById('c');
+const hud = document.getElementById('hud');
+const listEl = document.getElementById('list');
+const errEl = document.getElementById('err');
+
+const say = (s) => { hud.innerHTML = s; };
+const fail = (e) => {
+  errEl.style.display = 'grid';
+  errEl.textContent = `failed\n\n${e && (e.stack || e.message) || e}`;
+  console.error(e);
+};
+
+let entries = [];
+let viewer = null;
+let current = -1;
+let autoSpin = false;
+let dragging = false;
+
+function rowHtml(e, i) {
+  const photo = e.photo ? `<img src="${root}${e.photo}" alt="">` : '<div class="nophoto"></div>';
+  const bits = [];
+  if (e.opacity != null) bits.push(`op ${e.opacity}`);
+  if (e.gaussians != null) bits.push(`${(e.gaussians / 1000).toFixed(0)}k`);
+  return `<div class="row" data-i="${i}">${photo}<div class="meta">
+    <div class="name">${e.stem}</div>
+    <div class="sub">${e.label}${bits.length ? ' · ' + bits.join(' · ') : ''}</div>
+  </div></div>`;
+}
+
+function mark(i) {
+  [...listEl.children].forEach((el, k) => el.classList.toggle('on', k === i));
+  const el = listEl.children[i];
+  if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+}
+
+async function show(i) {
+  if (i < 0 || i >= entries.length) return;
+  current = i;
+  mark(i);
+  const e = entries[i];
+  say(`loading <b>${e.ply}</b>`);
+  try {
+    const splat = await loadPLY(root + e.ply);
+    viewer.setSplat(splat);
+    viewer.cam.az = 0.55;
+    viewer.cam.el = 0.10;
+    viewer.redraw();
+    const bits = [`<b>${e.stem}</b> · ${e.label}`];
+    if (e.gaussians != null) bits.push(`${e.gaussians.toLocaleString()} gaussians`);
+    if (e.opacity != null) bits.push(`opacity ${e.opacity}`);
+    if (e.secs != null) bits.push(`${e.secs}s`);
+    say(bits.join(' · '));
+    history.replaceState(null, '', `?manifest=${encodeURIComponent(manifestUrl)}&i=${i}`);
+    document.title = `${e.stem} · ${e.label}`;
+  } catch (err) {
+    fail(err);
+  }
+}
+
+try {
+  entries = await (await fetch(manifestUrl)).json();
+  if (!Array.isArray(entries) || !entries.length) throw new Error('empty manifest');
+  listEl.innerHTML = entries.map(rowHtml).join('');
+  document.getElementById('count').textContent =
+    `${entries.length} renders · ${new Set(entries.map((e) => e.stem)).size} photos`;
+  listEl.addEventListener('click', (ev) => {
+    const row = ev.target.closest('.row');
+    if (row) show(Number(row.dataset.i));
+  });
+
+  const gpu = await acquireGPU();
+  if (!gpu) throw new Error('no webgpu — this page needs a WebGPU-capable browser');
+  viewer = await createViewer(gpu, cv, {});
+  viewer.start();
+
+  // 交互：拖拽 = 方位角/俯仰角，滚轮 = 距离。改完立刻 redraw，不等自转。
+  cv.addEventListener('pointerdown', (ev) => {
+    dragging = true;
+    cv.classList.add('drag');
+    cv.setPointerCapture(ev.pointerId);
+    let px = ev.clientX;
+    let py = ev.clientY;
+    const move = (e2) => {
+      const dx = e2.clientX - px;
+      const dy = e2.clientY - py;
+      px = e2.clientX;
+      py = e2.clientY;
+      viewer.cam.az -= dx * 0.008;
+      viewer.cam.el = Math.max(-1.35, Math.min(1.35, viewer.cam.el + dy * 0.008));
+      viewer.redraw();
+    };
+    const up = () => {
+      dragging = false;
+      cv.classList.remove('drag');
+      cv.removeEventListener('pointermove', move);
+      cv.removeEventListener('pointerup', up);
+    };
+    cv.addEventListener('pointermove', move);
+    cv.addEventListener('pointerup', up);
+  });
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const d = viewer.cam.dist ?? viewer.cam.radius;
+    viewer.cam.dist = Math.max(0.4, Math.min((d ?? 2) * (1 + Math.sign(ev.deltaY) * 0.08), 12));
+    viewer.redraw();
+  }, { passive: false });
+
+  addEventListener('keydown', (ev) => {
+    if (ev.key === 'ArrowRight' || ev.key === 'j') show(current + 1);
+    else if (ev.key === 'ArrowLeft' || ev.key === 'k') show(current - 1);
+    else if (ev.key === ' ') {
+      ev.preventDefault();
+      autoSpin = !autoSpin;
+      if (autoSpin) viewer.start(); else viewer.stop();
+    }
+  });
+
+  const start = Number(q.get('i'));
+  await show(Number.isFinite(start) && start >= 0 ? start : 0);
+} catch (e) {
+  fail(e);
+}
+</script>

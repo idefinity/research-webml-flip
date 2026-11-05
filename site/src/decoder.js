@@ -17,6 +17,8 @@
 import { ort } from './onnx.js';
 
 const C0 = 0.28209479177387814;
+// cos(45°)：位置用的旋转是 Rx(-90)（见 buildGaussians），朝向得跟着同一个转
+const SQ2_2 = Math.SQRT1_2;
 
 // softplus(0.004) 的反函数，和上游 scale_bias 的算法一致
 const SCALE_BIAS = 0.004 + Math.log(-Math.expm1(-0.004));   // ≈ -5.5194
@@ -194,8 +196,9 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
       oz = Math.tanh(oz) * 0.5 * perturbe * os;
 
       // 两步都照着上游抄：_xyz 的 setter 先按 aabb=[-0.5,-0.5,-0.5,1,1,1]
-      // 平移（xyz = v*1 + (-0.5)），save_ply 再套默认变换 [[1,0,0],[0,0,-1],[0,1,0]]
-      // → (x, z, -y)。少了平移，整团会坐在 (0.5, 0.5, -0.5) 而不是原点。
+      // 平移（xyz = v*1 + (-0.5)），再套 save_ply 默认变换的逆 [[1,0,0],[0,0,1],[0,-1,0]]
+      // → (x, z, -y)，即 Rx(-90)。少了平移，整团会坐在 (0.5, 0.5, -0.5) 而不是原点。
+      // 朝向必须跟着同一个旋转走，见下面的四元数。
       const x = ox + px - 0.5;
       const y = oz + pz - 0.5;
       const z = 0.5 - (oy + py);
@@ -218,6 +221,15 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
       let qz = features[f + rt + 3] * lr._rotation;
       const qlen = Math.hypot(qw, qx, qy, qz) || 1;
 
+      // 和位置同一个 Rx(-90)：q' = q_R1 ⊗ q，q_R1 = [√2/2, -√2/2, 0, 0]。
+      // 上游 _get_ply_data 对位置和旋转都做 transform；这里只转位置的话，
+      // 学生输出 96% 是扁盘（中位轴比 0.05），盘面朝向全错，表面发毛。
+      // 旋转是正交的，qlen 不变，所以下面仍用转之前的长度归一化。
+      const qw2 = SQ2_2 * (qw + qx);
+      const qx2 = SQ2_2 * (qx - qw);
+      const qy2 = SQ2_2 * (qy + qz);
+      const qz2 = SQ2_2 * (qz - qy);
+
       data[o] = x;
       data[o + 1] = y;
       data[o + 2] = z;
@@ -230,10 +242,10 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
       data[o + 9] = softplus(features[f + sc + 1] * lr._scaling + SCALE_BIAS);
       data[o + 10] = softplus(features[f + sc + 2] * lr._scaling + SCALE_BIAS);
       data[o + 11] = 0;
-      data[o + 12] = qw / qlen;
-      data[o + 13] = qx / qlen;
-      data[o + 14] = qy / qlen;
-      data[o + 15] = qz / qlen;
+      data[o + 12] = qw2 / qlen;
+      data[o + 13] = qx2 / qlen;
+      data[o + 14] = qy2 / qlen;
+      data[o + 15] = qz2 / qlen;
       o += 16;
     }
   }

@@ -198,6 +198,16 @@ body[data-weights="check"] .boot-line.done .k.mono { color: var(--bad); }
   padding: var(--pad);
 }
 
+.drop-error {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  max-width: min(720px, calc(100% - 32px));
+  margin: 0; padding: 9px 16px; border-radius: 10px;
+  background: rgba(46, 18, 14, .94); border: 1px solid #d9614a;
+  color: #ffd8cf; font-size: 13px; line-height: 1.45;
+  text-align: center; overflow-wrap: anywhere;
+  pointer-events: none; z-index: 4;
+}
+
 .drop {
   width: min(620px, 86vw);
   aspect-ratio: 16 / 10;
@@ -374,6 +384,14 @@ body[data-stage="think"] .stage-drop { display: none; }
 
 .view-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .view-hint { margin: 0; font-size: 11px; color: var(--ink-3); }
+
+.view-banner {
+  position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+  margin: 0; padding: 7px 15px; border-radius: 999px;
+  background: rgba(20, 19, 15, .86); border: 1px solid var(--accent);
+  color: var(--ink); font-size: 12px; letter-spacing: .02em;
+  pointer-events: none; z-index: 3;
+}
 
 .ghost {
   background: none;

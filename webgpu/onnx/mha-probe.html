@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>MHA probe</title>
+<style>body{background:#14130f;color:#ecebe6;font:13px/1.6 ui-monospace,Menlo,monospace;padding:20px}#t td{padding:2px 14px 2px 0}.ok{color:#7fd18a}.bad{color:#e57b6b}.dim{color:#9c9a92}</style>
+</head>
+<body>
+<table id="t"></table>
+<div id="log"></div>
+<script type="module">
+import * as ort from 'https://unpkg.com/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs';
+import { parseNPY } from '../../site/src/npy.js';
+ort.env.wasm.wasmPaths = 'https://unpkg.com/onnxruntime-web@1.31.1/dist/';
+try { ort.env.webgpu.powerPreference = 'high-performance'; } catch {}
+const rows = [], $t = document.getElementById('t'), $l = document.getElementById('log');
+const row = (k,v,cls='') => { rows.push([k,v]); window.__rows = rows;
+  const tr = document.createElement('tr'); tr.innerHTML = `<td>${k}</td><td class="${cls}">${v}</td>`; $t.appendChild(tr); };
+const log = s => { $l.textContent += s + '\n'; };
+
+function cos(a,b){let d=0,x=0,y=0;for(let i=0;i<a.length;i++){d+=a[i]*b[i];x+=a[i]*a[i];y+=b[i]*b[i];}return d/Math.sqrt(x*y);}
+function rand(n,seed=1){const a=new Float32Array(n);let s=seed;for(let i=0;i<n;i++){s=(s*1103515245+12345)&0x7fffffff;a[i]=s/0x7fffffff-0.5;}return a;}
+
+async function main(){
+  const bytes = new Uint8Array(await (await fetch('mha3d_dyn.onnx')).arrayBuffer());
+  for (const ep of ['webgpu','wasm']) {
+    let sess;
+    try { sess = await ort.InferenceSession.create(bytes, { executionProviders:[ep], graphOptimizationLevel:'all' }); }
+    catch(e){ row(`session ${ep}`, String(e.message).slice(0,120), 'bad'); continue; }
+    row(`session ${ep}`, `inputs ${sess.inputNames} outputs ${sess.outputNames}`, 'dim');
+    // correctness at S=128 vs CPU reference
+    try {
+      const [q,k,v,ref] = await Promise.all(['q','k','v','ref'].map(async n =>
+        parseNPY(await (await fetch(`mha3d_${n}.npy`)).arrayBuffer()).data));
+      const out = await sess.run({ q:new ort.Tensor('float32',q,[1,128,1024]),
+                                   k:new ort.Tensor('float32',k,[1,128,1024]),
+                                   v:new ort.Tensor('float32',v,[1,128,1024]) });
+      const y = out.y.data;
+      row(`parity ${ep} S=128`, `cos ${cos(y,ref).toFixed(6)}`, cos(y,ref) > 0.999 ? 'ok':'bad');
+    } catch(e){ row(`parity ${ep}`, String(e.message).slice(0,140), 'bad'); }
+    for (const S of [2048, 12294]) {
+      const q=rand(S*1024,1), k=rand(S*1024,2), v=rand(S*1024,3);
+      try {
+        const feeds={q:new ort.Tensor('float32',q,[1,S,1024]),k:new ort.Tensor('float32',k,[1,S,1024]),v:new ort.Tensor('float32',v,[1,S,1024])};
+        let best=Infinity;
+        for(let r=0;r<3;r++){const t=performance.now();await sess.run(feeds);const dt=performance.now()-t;if(r>0)best=Math.min(best,dt);}
+        const flops = 4*S*S*1024;
+        row(`${ep} S=${S}`, `${best.toFixed(1)} ms · ${(flops/(best*1e6)).toFixed(0)} GFLOP/s`, best<1000?'ok':'dim');
+      } catch(e){ row(`${ep} S=${S}`, String(e.message).slice(0,140), 'bad'); }
+    }
+    sess.release?.();
+  }
+}
+main().then(()=>{window.__done=true;document.title='READY';})
+  .catch(e=>{row('error',e.message,'bad');log(String(e.stack||e));window.__done=true;document.title='READY';});
+</script>
+</body></html>

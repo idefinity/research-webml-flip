@@ -176,7 +176,30 @@ export async function createViewer(gpu, canvas, opts = {}) {
     return (cam.fit / Math.sin(fov / 2)) * 1.08;
   }
 
-  function setSplat(m) {
+  /**
+   * PLY 画廊：文件是 save_ply 的坐标系（Y 向下），viewer 是 Y 向上，翻一下位置。
+   * 2026-10-29 在 12 张用户照片和房子样例的 PLY 上逐一验证：不翻是头朝下，
+   * 翻了才是人站着。
+   *
+   * 流水线不走这条：decoder.buildGaussians 已经直接产出 viewer 坐标系
+   * （Y 向上、正面在 az≈2.0），main.js 传 raw:true 跳过这里。
+   * 反射没法用四元数表示（要同时翻一个局部轴），所以这里只翻位置；
+   * 画廊里的 PLY 没那么扁，视觉上可以接受。
+   */
+  function toViewFrame(m) {
+    if (m.viewFrame) return m;
+    const d = m.data;
+    for (let i = 0; i < m.count; i++) d[i * 16 + 1] = -d[i * 16 + 1];
+    const lo = m.min[1];
+    m.min[1] = -m.max[1];
+    m.max[1] = -lo;
+    if (m.center) m.center[1] = -m.center[1];
+    m.viewFrame = true;
+    return m;
+  }
+
+  function setSplat(m, opts = {}) {
+    if (!opts.raw) toViewFrame(m);
     model = m;
     const bytes = model.count * 16 * 4;
 
@@ -213,6 +236,9 @@ export async function createViewer(gpu, canvas, opts = {}) {
     order = new Uint32Array(model.count);
     depth = new Float32Array(model.count);
     counts = new Uint32Array(65536);
+
+    if (opts.az !== undefined) home.az = opts.az;
+    if (opts.el !== undefined) home.el = opts.el;
 
     cam.target = [model.center[0], (model.min[1] + model.max[1]) / 2, model.center[2]];
     cam.radius = model.radius;

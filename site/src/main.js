@@ -2,10 +2,9 @@ import { acquireGPU } from './gpu.js';
 import { createLoader } from './loader.js';
 import { createThink } from './think.js';
 import { createViewer } from './viewer.js';
-import { loadPLY } from './ply.js';
-import { streamWeights, weightUrls, verifyLine, tensorAt } from './weights.js';
 import {
-  MODE, SAMPLES, FALLBACK_PLY, runInference,
+  MODE, STAGES, SAMPLES, runInference, initModels, modelsReady,
+  ARTIFACT_BYTES,
 } from './pipeline.js';
 
 const $ = (id) => document.getElementById(id);
@@ -34,6 +33,8 @@ const el = {
   azVal: $('az-val'),
   viewCanvas: $('view-canvas'),
   viewHint: $('view-hint'),
+  viewBanner: $('view-banner'),
+  dropError: $('drop-error'),
   replay: $('btn-replay'),
   metaText: $('meta-text'),
   footGpu: $('foot-gpu'),
@@ -42,11 +43,18 @@ const el = {
 
 const STAGE_ELS = { boot: el.boot, drop: el.drop, think: el.think, view: el.view };
 
+// ?fix=1 跳过编码器，直接喂夹具条件：把「照片 → 条件」和「DiT + 解码器」分开看。
+const FIXTURE = new URLSearchParams(location.search).get('fix') === '1';
+
 let gpu = null;
 let loader = null;
 let viewer = null;
 let think = null;
 let runToken = 0;
+let modelError = null;
+// 结果标签的尾巴（本机推理 / 夹具条件 / 演示结果）。viewer 每秒报一次 fps，
+// 那一次重写标签，所以真话得存在这里，不能现场再猜。
+let lastLabel = '';
 
 function setStage(name) {
   document.body.dataset.stage = name;
@@ -61,7 +69,7 @@ async function boot() {
   document.body.dataset.booted = '1';
   el.footMode.textContent = MODE === 'demo'
     ? '演示管线：推理尚未接线，结果来自预烘焙 PLY'
-    : '本地推理 · 全部在浏览器内';
+    : '正在准备本机推理';
 
   gpu = await acquireGPU();
   document.body.dataset.gpu = gpu ? 'ready' : 'none';
@@ -82,8 +90,15 @@ async function boot() {
     el.footGpu.textContent = 'WebGPU 不可用';
   }
 
-  await loadWeights();
+  await preload();
   loader && loader.stop();
+
+  el.footMode.textContent = modelsReady()
+    ? '本机推理 · 编码器按需加载 · 4 步 int4 DiT + 解码器在浏览器里'
+    : '模型没加载成功 · 不会生成结果';
+  if (!modelsReady()) {
+    showDropError('模型没加载成功', modelError || new Error('未知原因'));
+  }
   setStage('drop');
 }
 
@@ -92,40 +107,27 @@ async function boot() {
 // 卡片扫完至少留这么久。本机读 200 MB 只要两三百毫秒，不设下限就只剩一眨。
 const BOOT_MIN_SWEEP = 1500;
 
-/** 桌面留下字节（下一步要喂给 GPU），手机只数不存。 */
-function canRetain() {
-  const mem = navigator.deviceMemory;
-  if (mem && mem < 8) return false;
-  return !matchMedia('(pointer: coarse)').matches;
-}
-
 /**
- * 真的读 assets/k2n/int4.bin。显示的是字节，不是时间：
- * 进度条走多快取决于盘和网络，走完了就是读完了。
+ * 真的把 4 个图 + 4 个夹具读进来（默认 HF，?local=../w/ 读本地），
+ * 进度条走的是字节数。失败不挡路：后面退回预烘焙 PLY。
  */
-function loadWeights() {
-  const urls = weightUrls();
+function preload() {
   const t0 = performance.now();
-  const st = { p: 0, read: 0, total: 0, tensor: '', rate: 0, stats: null };
+  const st = { file: '', loaded: 0, total: ARTIFACT_BYTES, rate: 0, phase: '' };
   let shown = 0;
   let done = false;
-  let failed = false;
-  let ledger = null;
   let failure = null;
+  let host = '';
 
-  const stream = streamWeights({
-    manifestUrl: urls.manifest,
-    binUrl: urls.bin,
-    retain: canRetain(),
-    onProgress(e) { Object.assign(st, e); },
-  }).then((r) => r, (e) => { failure = e; return null; });
+  const job = initModels({
+    onProgress(e) { Object.assign(st, e); if (e.host) host = e.host; },
+  }).then(() => {}, (e) => { failure = e; });
 
   return new Promise((resolve) => {
     function paint() {
       // 真实进度是上限：显示的字节数永远不会超过已经读到的字节数。
-      // 本机读 200 MB 只要两百毫秒，所以再给一个最慢的扫过速度，否则动画一闪就没了。
       const floorP = Math.min(1, (performance.now() - t0) / BOOT_MIN_SWEEP);
-      const real = failure ? 1 : st.p;
+      const real = failure ? 1 : (st.total ? st.loaded / st.total : 0);
       const target = Math.min(real, Math.max(shown, floorP));
       shown += (target - shown) * 0.14;
 
@@ -139,15 +141,12 @@ function loadWeights() {
         el.bootBytes.textContent = '—';
       }
 
-      // 扫到哪个张量就报哪个。读完了还要扫一小会儿，这时候按显示位置回报，
-      // 免得条子才过半就写"校验完成"。
-      let phase = st.tensor;
-      if (done && ledger && st.total) {
-        const seg = shown >= 0.999 ? null : tensorAt(ledger, shown * st.total);
-        phase = seg ? seg.name : (failed ? '权重不在本地' : '校验完成');
-      }
-      el.bootPhase.textContent = phase || '连接';
+      el.bootPhase.textContent = failure ? '模型不可用'
+        : st.phase === 'session' ? `创建会话 · ${st.file}`
+          : st.phase === 'done' && st.p >= 1 ? '就绪'
+            : st.file || '连接';
       el.bootRate.textContent = st.rate > 0 ? `${st.rate.toFixed(0)} MB/s` : '—';
+      el.bootTiers.textContent = 'DiT 245 MB · 解码器 208 MB · 条件夹具 24 MB';
     }
 
     function tick() {
@@ -161,27 +160,17 @@ function loadWeights() {
     }
     requestAnimationFrame(tick);
 
-    stream.then((r) => {
-      if (!r) {
-        // 权重不在本地（发布时 200 MB 不进 git）—— 进度退化成占位，页面照样能走。
-        document.body.dataset.weights = 'missing';
-        el.bootTiers.textContent = '权重不在本地 · 占位进度';
-        el.bootChecks.textContent = '跳过校验';
-        console.warn('weight stream failed:', failure && failure.message);
-        failed = true;
-        done = true;
-        return;
-      }
-
-      const L = r.ledger;
-      ledger = L;
-      document.body.dataset.weights = r.clean && !r.short ? 'ok' : 'check';
-      el.bootTiers.textContent =
-        `DiT 学生 · ${L.int4.n} 张量化 + ${L.fp16.n} 张 fp16 · ${(L.int4.params / 1e6).toFixed(0)} M 参数`;
-      el.bootChecks.textContent = verifyLine(r);
-      el.bootPhase.textContent = r.short ? '读短了' : '校验完成';
-      window.__flipWeights = r;   // 调试：__.bytes 就是那 209 MB
+    job.then(() => {
       done = true;
+      if (failure) {
+        modelError = failure;
+        document.body.dataset.weights = 'missing';
+        el.bootChecks.textContent = '模型取不到 · 不会生成结果';
+        console.warn('model preload failed:', failure.message);
+      } else {
+        document.body.dataset.weights = 'ok';
+        el.bootChecks.textContent = `${host === 'local' ? '本地文件' : host} · 3 个图 + 4 个夹具 · 已进 Cache`;
+      }
     });
   });
 }
@@ -198,7 +187,7 @@ function buildSamples() {
       fetch(s.image)
         .then((r) => r.blob())
         .then((blob) => createImageBitmap(blob))
-        .then((bmp) => start(bmp, s.ply))
+        .then((bmp) => start(bmp))
         .catch((e) => fail(e));
     });
     li.appendChild(b);
@@ -243,8 +232,7 @@ window.addEventListener('paste', (e) => {
 async function acceptBlob(blob) {
   try {
     const bmp = await createImageBitmap(blob);
-    // 任何输入都落到同一份预烘焙结果上——页脚已经写明。
-    start(bmp, FALLBACK_PLY);
+    start(bmp);
   } catch (err) {
     fail(err);
   }
@@ -252,8 +240,9 @@ async function acceptBlob(blob) {
 
 /* ------------------------------------------------------------------ 推理 */
 
-function start(bitmap, plyUrl) {
+function start(bitmap) {
   const token = ++runToken;
+  el.dropError.hidden = true;
 
   if (gpu) el.metaText.textContent = gpu.label;
   setStage('think');
@@ -264,23 +253,23 @@ function start(bitmap, plyUrl) {
   el.thinkPct.textContent = '0%';
   el.thinkRes.textContent = '…';
 
-  // PLY 在"解码"之前就该到，所以提前拉。它占的是网络，不是 GPU。
-  const modelPromise = loadPLY(plyUrl);
-  modelPromise.catch(() => {});
+  const signal = { get aborted() { return token !== runToken; } };
+  const onProgress = (p, stage) => {
+    if (token !== runToken) return;
+    think.draw(p);
+    el.thinkFill.style.width = `${(p * 100).toFixed(1)}%`;
+    el.thinkPct.textContent = `${Math.round(p * 100)}%`;
+    el.thinkPhase.textContent = stage.label;
+    const { w, h } = think.size;
+    el.thinkRes.textContent = `${w} × ${h}`;
+  };
 
-  runInference({
-    onProgress(p, stage) {
-      if (token !== runToken) return;
-      think.draw(p);
-      el.thinkFill.style.width = `${(p * 100).toFixed(1)}%`;
-      el.thinkPct.textContent = `${Math.round(p * 100)}%`;
-      el.thinkPhase.textContent = stage.label;
-      const { w, h } = think.size;
-      el.thinkRes.textContent = `${w} × ${h}`;
-    },
-    signal: { get aborted() { return token !== runToken; } },
-  })
-    .then(() => modelPromise)
+  // 模型没就绪就直接失败：不拿预烘焙结果冒充这一趟的输出。
+  const job = modelsReady()
+    ? runInference({ bitmap: FIXTURE ? null : bitmap, onProgress, signal })
+    : Promise.reject(modelError || new Error('模型没有加载成功'));
+
+  job
     .then(async (model) => {
       if (token !== runToken) return;
       await enterView(model);
@@ -293,14 +282,33 @@ function start(bitmap, plyUrl) {
 
 async function enterView(model) {
   setStage('view');
-  el.viewHint.textContent = MODE === 'demo'
-    ? `${model.count.toLocaleString()} 高斯 · 演示结果`
-    : `${model.count.toLocaleString()} 高斯`;
+  window.__flipSplat = model;   // 调试入口：__.count / __.data / __.encoded
+  // encoded 是这一趟到底有没有把照片变成条件。真实输入必须为 true；
+  // 只有显式的 fix=1 诊断模式才会是 false（bitmap 被主流程置空）。
+  const usedPhoto = model.encoded === true;
+  const label = usedPhoto ? '本机推理' : '夹具条件';
+  lastLabel = label;
+  el.viewHint.textContent = `${model.count.toLocaleString()} 高斯 · ${label}`;
+  if (!usedPhoto) {
+    el.viewBanner.hidden = false;
+    el.viewBanner.textContent = FIXTURE
+      ? '诊断模式 fix=1 · 故意忽略照片，条件来自夹具'
+      : '这一趟没有编码照片 · 条件来自夹具';
+  } else {
+    el.viewBanner.hidden = true;
+  }
+  window.__flipRun = {
+    usedPhoto, fix: FIXTURE, count: model.count,
+    dit: new URLSearchParams(location.search).get('dit') || 'default',
+  };
+  el.footMode.textContent = usedPhoto
+    ? '本机推理 · 编码器已接入 · 4 步 int4 DiT + 解码器在浏览器里'
+    : '本机推理 · 条件来自夹具（fix=1）';
 
   if (!gpu) {
     const note = document.createElement('p');
     note.className = 'view-fallback';
-    note.textContent = '这个浏览器没有 WebGPU，画不出高斯。结果文件已经生成。';
+    note.textContent = '这个浏览器没有 WebGPU，无法显示这批高斯。';
     el.view.appendChild(note);
     return;
   }
@@ -313,11 +321,14 @@ async function enterView(model) {
           el.azVal.textContent = `${Math.round(deg)}°`;
         },
         onStats({ fps, count }) {
-          el.viewHint.textContent = `${count.toLocaleString()} 高斯 · ${fps.toFixed(0)} fps`;
+          el.viewHint.textContent = `${count.toLocaleString()} 高斯 · ${fps.toFixed(0)} fps`
+            + (lastLabel ? ` · ${lastLabel}` : '');
         },
       });
     }
-    viewer.setSplat(model);
+    // decoder 已经产出 viewer 坐标系（Y 向上），不再翻 y；
+    // 正面视角由离线 EWA 转台实测（az=2.0 是脸部，3.35 是侧后方）
+    viewer.setSplat(model, { raw: true, az: 2.0, el: 0.18 });
     viewer.start();
     window.__flipView = viewer;   // 调试入口：__.cam.az = 1.57; __.redraw()
   } catch (err) {
@@ -335,9 +346,16 @@ el.replay.addEventListener('click', () => {
   if (note) note.remove();
 });
 
-function fail(err) {
+function showDropError(title, err) {
+  const msg = err && (err.message || err);
+  el.dropError.hidden = false;
+  el.dropError.textContent = `${title}：${msg || '未知原因'}`;
+}
+
+function fail(err, title = '生成失败') {
   console.error(err);
   el.metaText.textContent = `出错了：${err.message || err}`;
+  showDropError(title, err);
   runToken++;
   loader && loader.stop();
   setStage('drop');
@@ -347,4 +365,4 @@ function fail(err) {
 
 buildSamples();
 setStage('boot');
-boot().catch(fail);
+boot().catch((e) => fail(e, '启动失败'));

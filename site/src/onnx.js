@@ -7,7 +7,11 @@
 //   3. 张量要能在 GPU 上交接（gpu-buffer），DiT 的注意力走我们自己的核。
 
 const ORT_VERSION = '1.31.1';
-const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+// 默认走 jsDelivr。?ort=<base> 换一份同版本的 dist：这台机器的代理白名单里没有
+// cdn.jsdelivr.net，要在本机跑就得先 `npm pack onnxruntime-web@1.31.1` 拿到 dist，
+// 再让页面从那里读。.mjs 和 .wasm 必须同版本，混着用会在建会话时炸。
+const ORT_BASE = new URLSearchParams(location.search).get('ort')
+  || `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
 
 let ortPromise = null;
 

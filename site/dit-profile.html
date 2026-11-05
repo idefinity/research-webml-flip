@@ -1,0 +1,168 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>dit-profile</title>
+<pre id="out" style="white-space:pre-wrap;font:12px ui-monospace"></pre>
+<script type="module">
+// 把一步 DiT 拆开看：会话建立、冷跑、热跑、以及每个算子占多少。
+//
+//   dit-profile.html?local=../w/&ort=/w/ort/&file=dit.k12.int4.mha.onnx&runs=4
+//
+// 输入形状就是推理时那五个，值全零——这一步量的是时间，不是质量。
+// enableProfiling 本身有开销（每个节点记一条事件），所以热跑比线上略慢；
+// 算子占比不受影响，那才是这张表要回答的问题：十几秒一步，时间在谁身上。
+//
+// ORT-web 的 endProfiling() 返回 undefined —— 它把事件直接打到 console 上。
+// 所以这里把 console.log 兜住，事后拼回一个数组再统计。
+
+import { ort } from './src/onnx.js';
+
+const q = new URLSearchParams(location.search);
+const base = q.get('local') || '../w/';
+const file = q.get('file') || 'dit.k12.int4.mha.onnx';
+const runs = Number(q.get('runs') || 4);
+const out = document.getElementById('out');
+const lines = [];
+const log = (...a) => { const s = a.join(' '); lines.push(s); out.textContent = lines.join('\n'); console.log(s); };
+
+// 兜住 ORT 直接打到 console 的 profile 事件
+const captured = [];
+const verboseLines = [];
+const realLog = console.log.bind(console);
+console.log = (...a) => {
+  for (const v of a) {
+    if (typeof v === 'string' && v.indexOf('"cat"') >= 0) captured.push(v);
+    if (typeof v === 'string' && /assigned|CPUExecutionProvider|node/i.test(v)
+        && v.length > 40 && verboseLines.length < 400) verboseLines.push(v);
+  }
+  realLog(...a);
+};
+console.warn = console.error = console.log;
+
+function feeds(o) {
+  const z = (n) => new Float32Array(n);
+  return {
+    latent: new o.Tensor('float32', z(1 * 8192 * 16), [1, 8192, 16]),
+    camera: new o.Tensor('float32', z(1 * 1 * 5), [1, 1, 5]),
+    feature1: new o.Tensor('float32', z(1 * 4101 * 1280), [1, 4101, 1280]),
+    feature2: new o.Tensor('float32', z(1 * 4096 * 128), [1, 4096, 128]),
+    t: new o.Tensor('float32', z(1), [1]),
+  };
+}
+
+function parseCaptured() {
+  const text = '[' + captured.join('').replace(/,?\s*$/, '') + ']';
+  try { return JSON.parse(text); } catch { /* 下面按行兜底 */ }
+  const ev = [];
+  for (const chunk of captured) {
+    for (const line of chunk.split('\n')) {
+      const t = line.trim().replace(/,$/, '');
+      if (!t.startsWith('{"')) continue;
+      try { ev.push(JSON.parse(t)); } catch { /* 半行，跳过 */ }
+    }
+  }
+  return ev;
+}
+
+try {
+  const o = await ort();
+  log('ort', o.env?.versions?.web || '?');
+  if (q.get('verbose')) {
+    try { o.env.logLevel = 'verbose'; } catch { /* 没有就算了 */ }
+  }
+
+  const t0 = performance.now();
+  const buf = await (await fetch(base.replace(/\/$/, '') + '/' + file)).arrayBuffer();
+  log('bytes', (buf.byteLength / 1e6).toFixed(1), 'MB', 'fetch',
+      ((performance.now() - t0) / 1000).toFixed(1), 's');
+
+  const profile = q.get('prof') !== '0';
+  const t1 = performance.now();
+  const session = await o.InferenceSession.create(buf, {
+    executionProviders: ['webgpu'],
+    graphOptimizationLevel: 'all',
+    enableProfiling: profile,
+  });
+  log('create', ((performance.now() - t1) / 1000).toFixed(2), 's');
+  log('inputs', session.inputNames.join(','));
+
+  const cold = performance.now();
+  await session.run(feeds(o));
+  log('cold', ((performance.now() - cold) / 1000).toFixed(2), 's');
+
+  const warm = [];
+  for (let i = 0; i < runs; i++) {
+    const t = performance.now();
+    await session.run(feeds(o));
+    warm.push((performance.now() - t) / 1000);
+  }
+  const mean = warm.reduce((a, b) => a + b, 0) / warm.length;
+  log('warm', warm.map((v) => v.toFixed(2)).join(' '), '| mean', mean.toFixed(2));
+
+  let prof = null;
+  if (profile) { try { prof = await session.endProfiling(); } catch { /* web 上没有 */ } }
+  if (typeof prof === 'string') { try { prof = JSON.parse(prof); } catch { prof = null; } }
+  if (!prof) prof = parseCaptured();
+
+  const byOp = new Map();
+  const byProv = new Map();
+  let nodes = 0;
+  let totalUs = 0;
+  for (const e of prof || []) {
+    if (!e || e.cat !== 'Node' || !e.dur) continue;
+    const nm = String(e.name || '?');
+    const op = nm.includes('&') ? nm.split('&').pop() : ((e.args && e.args.op_name) || nm);
+    const prov = (e.args && e.args.provider) || '?';
+    nodes++;
+    totalUs += e.dur;
+    const cur = byOp.get(op) || { us: 0, n: 0 };
+    cur.us += e.dur;
+    cur.n++;
+    byOp.set(op, cur);
+    const pv = byProv.get(prov) || { us: 0, n: 0 };
+    pv.us += e.dur;
+    pv.n++;
+    byProv.set(prov, pv);
+  }
+  // 静默回退是这套栈最容易骗人的地方：节点落不到 WebGPU 就换 CPU，
+  // 输出照样对，只是慢十倍。先看这张表，再看算子表。
+  log('--- providers ---');
+  for (const [prov, v] of [...byProv.entries()].sort((a, b) => b[1].us - a[1].us)) {
+    const pct = totalUs ? (100 * v.us / totalUs).toFixed(1) : '0';
+    log(prov.padEnd(30), String(v.n).padStart(5), 'nodes',
+        (v.us / 1e6).toFixed(2).padStart(8), 's', pct.padStart(5) + '%');
+  }
+  if ([...byProv.keys()].some((p) => /cpu|wasm/i.test(p))) {
+    log('WARNING: some nodes did not land on WebGPU');
+  }
+  log('--- ops (summed over', (prof || []).length, 'events) ---');
+  for (const [op, v] of [...byOp.entries()].sort((a, b) => b[1].us - a[1].us).slice(0, 16)) {
+    const pct = totalUs ? (100 * v.us / totalUs).toFixed(1) : '0';
+    log(op.padEnd(30), String(v.n).padStart(5), 'nodes',
+        (v.us / 1e6).toFixed(2).padStart(8), 's', pct.padStart(5) + '%');
+  }
+  log('nodes', nodes, 'node-time', (totalUs / 1e6).toFixed(2), 's');
+
+  // 聚合会骗人：282 个 Add 里可能只有一个吃掉大半时间。按单个节点排一次。
+  const singles = (prof || [])
+    .filter((e) => e && e.cat === 'Node' && e.dur)
+    .sort((a, b) => b.dur - a.dur)
+    .slice(0, 15);
+  log('--- slowest single nodes ---');
+  for (const e of singles) {
+    const shapes = (e.args && e.args.input_type_shape)
+      ? JSON.stringify(e.args.input_type_shape).slice(0, 90) : '';
+    log((e.dur / 1000).toFixed(1).padStart(7), 'ms ', String(e.name).slice(0, 60), shapes);
+  }
+
+  if (verboseLines.length) {
+    log('--- ort verbose (assignment) ---');
+    for (const line of verboseLines.slice(0, 24)) log(line.slice(0, 220));
+  }
+
+  window.__rows = [['warm_mean_s', mean.toFixed(2)], ['cold_s', ((performance.now() - cold) / 1000).toFixed(1)]];
+} catch (e) {
+  log('ERR', e && (e.stack || e.message) || e);
+  window.__err = String(e && (e.message || e));
+}
+window.__done = true;
+</script>

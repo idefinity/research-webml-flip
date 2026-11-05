@@ -48,6 +48,7 @@
 
   <!-- 1 · 投图：拖进来、点一下、或者粘贴 -->
   <section class="stage stage-drop" id="stage-drop" aria-label="选择一张照片">
+    <p class="drop-error" id="drop-error" hidden role="alert"></p>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="选择或拖入一张照片">
       <div class="drop-inner">
         <svg class="drop-glyph" viewBox="0 0 64 64" aria-hidden="true">
@@ -58,6 +59,7 @@
         <p class="drop-title">把照片丢进来</p>
         <p class="drop-hint">或者点击选择 · 也可以直接粘贴 · 只在本机解码</p>
         <p class="drop-rule">单人、侧身、背景干净，效果最好</p>
+        <p class="drop-rule">编码器首次按需加载（约 200 MB），之后照片全程在本机推理</p>
       </div>
     </div>
     <ul class="samples" id="samples" aria-label="没有照片？用一张现成的">
@@ -90,6 +92,7 @@
   <!-- 3 · 结果：真正的高斯 -->
   <section class="stage stage-view" id="stage-view" aria-label="结果">
     <canvas class="view-canvas" id="view-canvas"></canvas>
+    <p class="view-banner" id="view-banner" hidden></p>
     <div class="view-hud">
       <div class="view-left">
         <span class="az-label">方位</span>

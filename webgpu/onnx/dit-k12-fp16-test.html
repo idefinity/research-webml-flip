@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>DiT k12 fp16 A/B</title>
+<style>body{background:#14130f;color:#ecebe6;font:13px/1.6 ui-monospace,Menlo,monospace;padding:20px}#t td{padding:2px 16px 2px 0}.ok{color:#7fd18a}.bad{color:#e57b6b}.dim{color:#9c9a92}#log{white-space:pre-wrap;color:#9c9a92}</style>
+</head>
+<body>
+<table id="t"></table><div id="log"></div>
+<script type="module">
+import { parseNPY } from '../../site/src/npy.js';
+
+// Is fp16 worth it, and on which ops? All graphs share the same weights and
+// the same fp32 ops between them; only the heavy ops changed dtype:
+//
+//   fp32     dit.k12.int4.mha.onnx          b128 reference
+//   mha16    ...mha16.onnx                  28 MHA nodes cast q,k,v to f16
+//   nbits16  ...nbits16.onnx                204 MatMulNBits A + scales f16
+//   q4f16    ...q4f16.onnx                  both
+//   b32      dit.k12.int4.b32.onnx          same weights rebuilt at block 32
+//   b32n16   dit.k12.int4.b32n16.onnx       block 32 + MatMulNBits f16
+//
+// Measured 2026-11-02: fp16 MHA costs 5.4% on the first velocity (fp16
+// accumulation over 12294 keys), while fp16 MatMulNBits adds no measurable
+// error on top of it. b128 runs 62 s/step against the old b32 graph's 25 s,
+// so the block size is the suspect for the baseline.
+//
+// q4f16 runs first: if a kernel is missing from the WebGPU EP, ORT silently
+// puts that node on CPU and step 1 takes minutes, not seconds. The guard cuts
+// a variant after one step over 90 s instead of hanging the tab.
+//
+// ?v=fp32,mha16   pick variants (default b32,b32n16,fp32)
+// ?steps=1        quick timing + first-velocity check (default 4)
+const Q = new URLSearchParams(location.search);
+const ORT_BASE = Q.get('ort') || 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
+const ort = await import(ORT_BASE + 'ort.webgpu.min.mjs');
+try { ort.env.webgpu.powerPreference = 'high-performance'; } catch {}
+
+const BASE = Q.get('base') || '../../w/';
+const ALL = {
+  q4f16: 'dit.k12.int4.q4f16.onnx',
+  fp32: 'dit.k12.int4.mha.onnx',
+  mha16: 'dit.k12.int4.mha16.onnx',
+  nbits16: 'dit.k12.int4.nbits16.onnx',
+  b32: 'dit.k12.int4.b32.onnx',
+  b32n16: 'dit.k12.int4.b32n16.onnx',
+  k2n: 'dit.k2n.onnx',
+  noattn: 'dit.k12.int4.b32.noattn.onnx',
+};
+// noattn replaces every MHA output with zeros: timing only, no numeric meaning.
+const TIMING_ONLY = new Set(['noattn']);
+const order = (Q.get('v') || 'b32,b32n16,fp32').split(',').map((s) => s.trim()).filter((s) => ALL[s]);
+const stepsWanted = Math.min(8, Math.max(1, Number(Q.get('steps')) || 4));
+const GUARD_MS = 90_000;
+
+const rows = [], $t = document.getElementById('t'), $l = document.getElementById('log');
+const row = (k, v, cls = '') => {
+  rows.push([k, v]); window.__rows = rows;
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${k}</td><td class="${cls}">${v}</td>`;
+  $t.appendChild(tr);
+};
+const log = (s) => { $l.textContent += s + '\n'; };
+const npy = async (f) => parseNPY(await (await fetch(BASE + f)).arrayBuffer());
+function stat(a, b) {
+  let d = 0, x = 0, y = 0, e = 0;
+  for (let i = 0; i < a.length; i++) {
+    d += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i];
+    const t = a[i] - b[i]; e += t * t;
+  }
+  return { cos: d / Math.sqrt(x * y), rel: Math.sqrt(e) / Math.sqrt(y) };
+}
+const finite = (a) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return false; return true; };
+
+const grid = [[1, 0.9], [0.9, 0.75], [0.75, 0.5], [0.5, 0]].slice(0, stepsWanted);
+
+async function main() {
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+  row('adapter', adapter ? [(adapter.info?.vendor || ''), (adapter.info?.architecture || '')].join(' ') : 'none', 'dim');
+  row('plan', `${order.join(' → ')} · ${stepsWanted} step${stepsWanted > 1 ? 's' : ''}`, 'dim');
+
+  const [f1n, f2n, n0, n1] = await Promise.all(
+    ['cond_feature1.npy', 'cond_feature2.npy', 'noise_0.npy', 'noise_1.npy'].map(npy));
+  const f1 = new Float32Array(f1n.data);
+  const f2 = new Float32Array(4096 * 128);
+  f2.set(f2n.data.subarray(5 * 128, 5 * 128 + 4096 * 128));
+  log(`fixtures: f1 ${f1n.shape} · f2 ${f2n.shape} -> 4096 · noise ${n0.shape}`);
+
+  const feeds = (o, l, c, t) => ({
+    latent: new o.Tensor('float32', l, [1, 8192, 16]),
+    camera: new o.Tensor('float32', c, [1, 1, 5]),
+    feature1: new o.Tensor('float32', f1, [1, 4101, 1280]),
+    feature2: new o.Tensor('float32', f2, [1, 4096, 128]),
+    t: new o.Tensor('float32', new Float32Array([1000 * t]), [1]),
+  });
+
+  const finals = {};
+  for (const id of order) {
+    const file = ALL[id];
+    let bytes = null, sess = null;
+    try {
+      const f0 = performance.now();
+      bytes = new Uint8Array(await (await fetch(BASE + file)).arrayBuffer());
+      const fetchS = (performance.now() - f0) / 1000;
+      const t0 = performance.now();
+      sess = await ort.InferenceSession.create(bytes, {
+        executionProviders: ['webgpu'], graphOptimizationLevel: 'all',
+      });
+      row(`${id} session`, `${(performance.now() - t0).toFixed(0)} ms · ${(bytes.length / 1e6).toFixed(1)} MB · fetch ${fetchS.toFixed(1)} s`, 'dim');
+
+      let lat = new Float32Array(n0.data);
+      let cam = new Float32Array(n1.data).slice(0, 5);
+      let vel = null, velCam = null, finished = true;
+      const times = [];
+
+      for (let s = 0; s < grid.length; s++) {
+        const [t, tp] = grid[s], dt = t - tp;
+        const st = performance.now();
+        const out = await sess.run(feeds(ort, lat, cam, t));
+        const ms = performance.now() - st;
+        times.push(ms);
+        const vl = out.out_latent.data, vc = out.out_camera.data;
+        if (s === 0) { vel = new Float32Array(vl); velCam = new Float32Array(vc); }
+        for (let i = 0; i < lat.length; i++) lat[i] -= vl[i] * dt;
+        for (let i = 0; i < cam.length; i++) cam[i] -= vc[i] * dt;
+        const ok = finite(lat);
+        row(`${id} step ${s + 1} (t=${t})`, `${(ms / 1000).toFixed(1)} s${s === 0 ? ' · cold' : ''} · finite ${ok}`, ok ? 'ok' : 'bad');
+        log(`${id} step ${s + 1}: latent std ${Math.sqrt(lat.reduce((a, x) => a + x * x, 0) / lat.length).toFixed(4)} · camera ${[...cam].map((v) => v.toFixed(4)).join(' ')}`);
+        if (s === 0 && ms > GUARD_MS) {
+          row(`${id} aborted`, `step 1 took ${(ms / 1000).toFixed(0)} s — suspect a CPU fallback`, 'bad');
+          finished = false;
+          break;
+        }
+      }
+
+      if (times.length > 1) {
+        const warm = times.slice(1);
+        row(`${id} warm mean`, `${(warm.reduce((a, b) => a + b, 0) / warm.length / 1000).toFixed(1)} s/step over ${warm.length}`, 'dim');
+      }
+      finals[id] = { lat, cam, vel, velCam, finished };
+    } catch (e) {
+      row(`${id} error`, String(e.message).slice(0, 300), 'bad');
+      log(`${id}: ${String(e.stack || e)}`);
+    } finally {
+      if (sess) { try { await sess.release(); } catch { /* already gone */ } }
+      bytes = null;
+    }
+  }
+
+  const ref = finals.fp32 && finals.fp32.finished ? finals.fp32 : null;
+  if (ref) {
+    for (const id of order) {
+      const v = finals[id];
+      if (!v || !v.finished || id === 'fp32' || TIMING_ONLY.has(id)) continue;
+      const sl = stat(v.lat, ref.lat), sc = stat(v.cam, ref.cam), sv = stat(v.vel, ref.vel);
+      row(`${id} vs fp32 · first velocity`, `cos ${sv.cos.toFixed(6)} · rel_l2 ${sv.rel.toFixed(5)}`, sv.cos > 0.999 ? 'ok' : 'bad');
+      row(`${id} vs fp32 · final latent`, `cos ${sl.cos.toFixed(6)} · rel_l2 ${sl.rel.toFixed(5)}`, sl.cos > 0.99 ? 'ok' : 'bad');
+      let m = 0;
+      for (let i = 0; i < v.cam.length; i++) m = Math.max(m, Math.abs(v.cam[i] - ref.cam[i]));
+      row(`${id} vs fp32 · camera`, `cos ${sc.cos.toFixed(6)} · maxabs ${m.toExponential(2)}`, 'dim');
+    }
+  } else if (finals.fp32) {
+    log('fp32 did not finish, no numeric reference this run');
+  }
+}
+
+main().then(() => { window.__done = true; document.title = 'READY'; })
+  .catch((e) => { row('error', String(e.message).slice(0, 300), 'bad'); log(String(e.stack || e)); window.__done = true; document.title = 'READY'; });
+</script>
+</body></html>

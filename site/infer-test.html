@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>infer-test</title>
+<style>
+  html, body { margin: 0; background: #0a0a0a; }
+  canvas { display: block; }
+</style>
+<canvas id="c"></canvas>
+<pre id="out" style="display:none"></pre>
+<script type="module">
+// 跑一遍整条链，把结果用固定机位画出来，方便截屏对比。
+//
+//   infer-test.html?img=../assets/k2u/hf_0000.jpg&steps=4&az=0.55&el=0.10
+//
+// 和 enc-test 的区别：那个只报数字和分段时间，这个出图。机位固定（不转发），
+// 所以两次截图可以直接并排看；不同步数之间唯一的差别就是采样网格。
+
+import { acquireGPU } from './src/gpu.js';
+import { createViewer } from './src/viewer.js';
+import { runInference, sampleSteps } from './src/pipeline.js';
+
+const q = new URLSearchParams(location.search);
+const cv = document.getElementById('c');
+const W = Number(q.get('w') || 640);
+const H = Number(q.get('h') || 640);
+cv.style.width = `${W}px`;
+cv.style.height = `${H}px`;
+cv.width = W;
+cv.height = H;
+
+const out = document.getElementById('out');
+const log = (...a) => { const s = a.join(' '); out.textContent += s + '\n'; console.log(s); };
+
+try {
+  const img = q.get('img') || '../assets/k2u/hf_0000.jpg';
+  const bmp = await createImageBitmap(await (await fetch(img)).blob());
+  const steps = sampleSteps();
+  const t0 = performance.now();
+  let tSample = 0;
+  const splat = await runInference({
+    bitmap: bmp,
+    onProgress(p, s) {
+      if (s && s.key === 'sample' && !tSample) tSample = performance.now() - t0;
+    },
+  });
+  const secs = (performance.now() - t0) / 1000;
+
+  // 出图之外再报两个数：高斯有没有、opacity 多大。渲染是黑的，得知道是"没东西"
+  // 还是"机位/光栅器没跟上"——这两件事的修法完全不同。
+  let op = 0;
+  for (let i = 0; i < splat.count; i++) op += splat.data[i * 16 + 3];
+  op /= splat.count;
+
+  const gpu = await acquireGPU();
+  const viewer = await createViewer(gpu, cv, {});
+  viewer.setSplat(splat);
+  await viewer.start();
+  await new Promise((r) => setTimeout(r, 1200));
+  viewer.stop();
+  viewer.cam.az = Number(q.get('az') ?? 0.55);
+  viewer.cam.el = Number(q.get('el') ?? 0.10);
+  viewer.redraw();
+  await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  log('steps', steps, 'secs', secs.toFixed(1), 'encode_start', (tSample / 1000).toFixed(1),
+      'count', splat.count, 'encoded', splat.encoded,
+      'opacity', op.toFixed(4),
+      'bbox', JSON.stringify([splat.min, splat.max].map((v) => v.map((x) => +x.toFixed(3)))));
+  window.__rows = [['steps', steps], ['secs', secs.toFixed(1)]];
+  window.__done = true;
+} catch (e) {
+  log('ERR', e && (e.stack || e.message) || e);
+  window.__err = String(e && (e.message || e));
+  window.__done = true;
+}
+</script>

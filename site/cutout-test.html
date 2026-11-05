@@ -1,0 +1,260 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cutout-test · k3 预处理 + 端到端</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0b0c; color: #e8e6e3;
+         font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           padding: 12px 16px; border-bottom: 1px solid #222; }
+  h1 { font-size: 13px; margin: 0 8px 0 0; font-weight: 600; }
+  button, input[type=file] { font: inherit; color: inherit; background: #1a1a1c;
+           border: 1px solid #333; padding: 6px 10px; border-radius: 6px; }
+  button:disabled { opacity: .45; }
+  #status { color: #9a9a9a; }
+  #prog { color: #f0c86a; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+         gap: 12px; padding: 12px 16px; }
+  #previews { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+              gap: 10px; align-content: start; }
+  figure { margin: 0; background: #111; border: 1px solid #222; border-radius: 8px;
+           overflow: hidden; }
+  figure img { display: block; width: 100%; height: auto; min-height: 80px; background: #000; }
+  figcaption { padding: 6px 8px; color: #8f8f8f; border-top: 1px solid #1c1c1c; }
+  #viewWrap { background: #111; border: 1px solid #222; border-radius: 8px;
+              overflow: hidden; display: flex; flex-direction: column; }
+  #view { width: 100%; height: 560px; display: block; background: #0e0e10; }
+  #hint { padding: 6px 8px; color: #8f8f8f; border-top: 1px solid #1c1c1c; }
+  #err { display: none; margin: 0 16px 12px; padding: 10px 12px; color: #ff9b9b;
+         background: #1f1010; border: 1px solid #562222; border-radius: 8px;
+         white-space: pre-wrap; }
+  #log { margin: 0 16px; padding: 10px 12px; background: #101012; border: 1px solid #222;
+         border-radius: 8px; max-height: 30vh; overflow: auto; white-space: pre-wrap; }
+  footer { padding: 10px 16px 16px; color: #737373; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+    #previews { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    #view { height: 420px; }
+  }
+</style>
+
+<header>
+  <h1>cutout-test</h1>
+  <input type="file" id="file" accept="image/*">
+  <button id="pre" disabled>只预处理</button>
+  <button id="run" disabled>跑完整条链</button>
+  <span id="status">选一张图，或把图拖进来</span>
+  <span id="prog"></span>
+</header>
+
+<main>
+  <section id="previews">
+    <figure><img id="src" alt=""><figcaption>source</figcaption></figure>
+    <figure><img id="canvas" alt=""><figcaption>DiT canvas 1024²（黑底裁切）</figcaption></figure>
+    <figure><img id="mask" alt=""><figcaption>matte alpha（原尺寸）</figcaption></figure>
+  </section>
+  <section id="viewWrap">
+    <canvas id="view"></canvas>
+    <div id="hint">3D 结果：拖拽旋转，滚轮缩放，双击复位</div>
+  </section>
+</main>
+
+<div id="err"></div>
+<pre id="log">ready</pre>
+<footer>
+  必须从仓库根目录起 http.server，页面才能读到 ../w/ 和 ../assets/：
+  <code>python3 -m http.server 8899 --bind 127.0.0.1</code>，然后打开
+  <code>http://127.0.0.1:8899/site/cutout-test.html?local=../w/&amp;ort=/w/ort/</code>。
+  也可以用 <code>?img=../input_example/af2.webp</code> 自动装一张。
+</footer>
+
+<script type="module">
+// 这条页面不重写预处理：它调用 site/src/pipeline.js 里真正发布的那条路，
+// loadCondition 负责 k3 裁切，runInference 负责 4 步 DiT + 八叉树 + 高斯。
+import { acquireGPU } from './src/gpu.js';
+import { createViewer } from './src/viewer.js';
+import { loadCondition, runInference } from './src/pipeline.js?v=cutout1';
+
+const q = new URLSearchParams(location.search);
+const el = {
+  file: document.getElementById('file'),
+  pre: document.getElementById('pre'),
+  run: document.getElementById('run'),
+  status: document.getElementById('status'),
+  prog: document.getElementById('prog'),
+  src: document.getElementById('src'),
+  canvas: document.getElementById('canvas'),
+  mask: document.getElementById('mask'),
+  view: document.getElementById('view'),
+  hint: document.getElementById('hint'),
+  err: document.getElementById('err'),
+  log: document.getElementById('log'),
+};
+
+let bitmap = null;
+let viewer = null;
+let busy = false;
+
+function log(...a) {
+  const s = a.join(' ');
+  el.log.textContent += `\n${s}`;
+  el.log.scrollTop = el.log.scrollHeight;
+  console.log(s);
+}
+function fail(e) {
+  const msg = e && (e.stack || e.message) || String(e);
+  el.err.style.display = 'block';
+  el.err.textContent = `失败：${msg}`;
+  el.status.textContent = 'failed';
+  log('ERR', msg);
+}
+function setBusy(v) {
+  busy = v;
+  el.pre.disabled = v || !bitmap;
+  el.run.disabled = v || !bitmap;
+  el.file.disabled = v;
+}
+function showCond(tag) {
+  const c = window.__flipCond;
+  if (!c) return false;
+  const { canvas, mask } = c.png();
+  el.canvas.src = canvas;
+  el.mask.src = mask;
+  log(`canvas ${c.width}x${c.height} · crop [${c.crop.join(', ')}] · intrinsic alpha ${c.intrinsic} · ${tag}`);
+  return true;
+}
+async function useImage(blob, name) {
+  try {
+    el.err.style.display = 'none';
+    el.log.textContent = 'ready';
+    setBusy(true);
+    if (viewer) { viewer.stop(); viewer = null; }
+    bitmap = await createImageBitmap(blob);
+    el.src.src = URL.createObjectURL(blob);
+    el.canvas.removeAttribute('src');
+    el.mask.removeAttribute('src');
+    el.hint.textContent = '3D 结果：拖拽旋转，滚轮缩放，双击复位';
+    log(`image ${name || ''} ${bitmap.width}x${bitmap.height}`);
+    el.status.textContent = 'ready';
+  } catch (e) {
+    bitmap = null;
+    fail(e);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function preprocess() {
+  if (!bitmap || busy) return;
+  setBusy(true);
+  window.__flipCond = null;
+  el.err.style.display = 'none';
+  el.prog.textContent = '';
+  const t0 = performance.now();
+  try {
+    el.status.textContent = 'encoding…';
+    const cond = await loadCondition(bitmap, {
+      progress(p) { el.prog.textContent = `encode ${(p * 100).toFixed(0)}%`; },
+    });
+    if (!cond) throw new Error('loadCondition 返回 null（编码器不可用）');
+    if (!showCond('preprocess')) throw new Error('没有拿到 __flipCond 画布');
+    log(`encode ${((performance.now() - t0) / 1000).toFixed(1)} s · f1 ${cond.feature1.length} · f2 ${cond.feature2.length}`);
+    el.status.textContent = 'canvas ready';
+  } catch (e) {
+    fail(e);
+  } finally {
+    el.prog.textContent = '';
+    setBusy(false);
+  }
+}
+
+async function run() {
+  if (!bitmap || busy) return;
+  setBusy(true);
+  window.__flipCond = null;
+  el.err.style.display = 'none';
+  el.prog.textContent = '';
+  if (viewer) { viewer.stop(); viewer = null; }
+  const t0 = performance.now();
+  const marks = {};
+  let captured = false;
+  const timer = setInterval(() => {
+    if (!captured && showCond('live')) captured = true;
+  }, 200);
+  try {
+    el.status.textContent = 'running…';
+    const splat = await runInference({
+      bitmap,
+      onProgress(p, s) {
+        if (s && s.key && marks[s.key] === undefined) {
+          marks[s.key] = (performance.now() - t0) / 1000;
+        }
+        el.prog.textContent = `${Math.round(p * 100)}% · ${s ? s.label : ''}`;
+      },
+    });
+    clearInterval(timer);
+    if (!captured) showCond('end');
+    const secs = (performance.now() - t0) / 1000;
+
+    let op = 0, sc = 0;
+    for (let i = 0; i < splat.count; i++) {
+      op += splat.data[i * 16 + 3];
+      sc += splat.data[i * 16 + 8];
+    }
+    const split = ['encode', 'sample', 'decode']
+      .map((k, i, a) => {
+        const start = marks[k];
+        const end = a[i + 1] ? marks[a[i + 1]] : secs;
+        return `${k} ${start === undefined ? '?' : (end - start).toFixed(1)}s`;
+      }).join(' · ');
+    log(`splat ${splat.count} · ${secs.toFixed(1)} s · encoded ${splat.encoded}`);
+    log(split);
+    log(`opacity ${(op / splat.count).toFixed(4)} · scale ${(sc / splat.count).toFixed(5)}`
+        + ` · bbox x [${splat.min[0].toFixed(3)}, ${splat.max[0].toFixed(3)}]`);
+
+    const gpu = await acquireGPU();
+    viewer = await createViewer(gpu, el.view, {
+      onStats({ fps, count }) {
+        el.hint.textContent = `${count.toLocaleString()} 高斯 · ${fps.toFixed(0)} fps`
+          + ' · 拖拽旋转，滚轮缩放，双击复位';
+      },
+    });
+    viewer.setSplat(splat, { raw: true, az: 2.0, el: 0.18 });
+    viewer.start();
+    window.__flipView = viewer;
+    window.__splat = splat;
+    el.status.textContent = `done · ${secs.toFixed(1)} s`;
+  } catch (e) {
+    clearInterval(timer);
+    fail(e);
+  } finally {
+    el.prog.textContent = '';
+    setBusy(false);
+  }
+}
+
+el.file.addEventListener('change', () => {
+  const f = el.file.files && el.file.files[0];
+  if (f) useImage(f, f.name);
+});
+el.pre.addEventListener('click', preprocess);
+el.run.addEventListener('click', run);
+
+for (const ev of ['dragover', 'drop']) {
+  window.addEventListener(ev, (e) => {
+    e.preventDefault();
+    if (busy) return;
+    if (ev === 'drop' && e.dataTransfer && e.dataTransfer.files[0]) {
+      useImage(e.dataTransfer.files[0], e.dataTransfer.files[0].name);
+    }
+  });
+}
+
+const auto = q.get('img');
+if (auto) {
+  fetch(auto)
+    .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status} ${auto}`); return r.blob(); })
+    .then((b) => useImage(b, auto))
+    .catch(fail);
+}
+</script>

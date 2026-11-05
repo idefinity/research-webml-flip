@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>enc-test</title>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script type="module">
+import { runInference, encoderReady } from './src/pipeline.js?v=10';
+
+const out = document.getElementById('out');
+let last = -1;
+function log(...a) {
+  const s = a.join(' ');
+  out.textContent += s + '\n';
+  console.log(s);
+}
+
+// ?local=../w/ 从仓库读权重，?ort=/w/ort/ 换一份本地 ONNX Runtime；
+// 这台机器的代理白名单里没有 HF 和 jsDelivr，浏览器只能从本地取。
+const q = new URLSearchParams(location.search);
+try {
+  const img = q.get('img') || '../assets/k2u/hf_0000.jpg';
+  const blob = await (await fetch(img)).blob();
+  const bmp = await createImageBitmap(blob);
+  log('bitmap', bmp.width, bmp.height);
+  const marks = {};
+  const t0 = performance.now();
+  const splat = await runInference({
+    bitmap: bmp,
+    onProgress(p, s) {
+      if (s && s.key && marks[s.key] === undefined) {
+        marks[s.key] = (performance.now() - t0) / 1000;
+        log('stage', s.key, 'starts at', marks[s.key].toFixed(1));
+      }
+      if (p - last < 0.02 && p < 1) return;
+      last = p;
+      log('p', p.toFixed(3), s && s.key);
+    },
+  });
+  const secs = (performance.now() - t0) / 1000;
+  log('count', splat.count, 'ms', (performance.now() - t0).toFixed(0),
+      'encoder', encoderReady());
+  const end = [marks.encode, marks.sample, marks.decode, secs];
+  log('split', `encode ${end[1] ? (end[1] - end[0]).toFixed(1) : '?'}s`,
+      `sample ${end[2] ? (end[2] - end[1]).toFixed(1) : '?'}s`,
+      `decode ${end[3] ? (end[3] - end[2]).toFixed(1) : '?'}s`,
+      `load ${end[0] ? end[0].toFixed(1) : '?'}s`);
+
+  const n = splat.count;
+  let op = 0, sc = 0;
+  for (let i = 0; i < n; i++) {
+    op += splat.data[i * 16 + 3];
+    sc += splat.data[i * 16 + 8];
+  }
+  log('stats', `opacity ${(op / n).toFixed(4)}`,
+      `scale ${(sc / n).toFixed(5)}`,
+      `x [${splat.min[0].toFixed(3)}, ${splat.max[0].toFixed(3)}]`);
+  window.__rows = [
+    ['count', n],
+    ['seconds', secs.toFixed(1)],
+    ['opacity', (op / n).toFixed(4)],
+    ['scale', (sc / n).toFixed(5)],
+    ['x_min', splat.min[0].toFixed(3)],
+    ['x_max', splat.max[0].toFixed(3)],
+    ['encoder', String(encoderReady())],
+  ];
+  window.__splat = splat;
+} catch (e) {
+  log('ERR', e && (e.stack || e.message) || e);
+}
+window.__done = true;
+</script>

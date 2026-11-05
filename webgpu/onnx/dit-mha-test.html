@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>DiT MHA e2e</title>
+<style>body{background:#14130f;color:#ecebe6;font:13px/1.6 ui-monospace,Menlo,monospace;padding:20px}#t td{padding:2px 16px 2px 0}.ok{color:#7fd18a}.bad{color:#e57b6b}.dim{color:#9c9a92}#log{white-space:pre-wrap;color:#9c9a92}</style>
+</head>
+<body>
+<table id="t"></table><div id="log"></div>
+<script type="module">
+import * as ort from 'https://unpkg.com/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs';
+import { parseNPY } from '../../site/src/npy.js';
+ort.env.wasm.wasmPaths = 'https://unpkg.com/onnxruntime-web@1.31.1/dist/';
+try { ort.env.webgpu.powerPreference = 'high-performance'; } catch {}
+const Q = new URLSearchParams(location.search);
+const BASE = Q.get('base') || '../../w/';
+const rows=[], $t=document.getElementById('t'), $l=document.getElementById('log');
+const row=(k,v,cls='')=>{rows.push([k,v]);window.__rows=rows;const tr=document.createElement('tr');tr.innerHTML=`<td>${k}</td><td class="${cls}">${v}</td>`;$t.appendChild(tr);};
+const log=s=>{$l.textContent+=s+'\n';};
+const npy=async f=>parseNPY(await (await fetch(BASE+f)).arrayBuffer());
+function stat(a,b){let d=0,x=0,y=0,e=0;for(let i=0;i<a.length;i++){d+=a[i]*b[i];x+=a[i]*a[i];y+=b[i]*b[i];const t=a[i]-b[i];e+=t*t;}return{cos:d/Math.sqrt(x*y),rel:Math.sqrt(e)/Math.sqrt(y)};}
+const finite=a=>{for(let i=0;i<a.length;i++)if(!Number.isFinite(a[i]))return false;return true;};
+
+async function main(){
+  const adapter=await navigator.gpu?.requestAdapter({powerPreference:'high-performance'});
+  row('adapter', adapter ? [(adapter.info?.vendor||''),(adapter.info?.architecture||'')].join(' ') : 'none', 'dim');
+  const bytes=new Uint8Array(await (await fetch(BASE+'dit.k2n.onnx')).arrayBuffer());
+  row('graph', `${(bytes.length/1e6).toFixed(1)} MB`, 'dim');
+  const t0=performance.now();
+  const sess=await ort.InferenceSession.create(bytes,{executionProviders:['webgpu'],graphOptimizationLevel:'all'});
+  row('session', `${(performance.now()-t0).toFixed(0)} ms · in ${sess.inputNames.join(',')}`, 'ok');
+  const [f1n,f2n,n0,n1,l1,l1c,l2,l2c]=await Promise.all(
+    ['cond_feature1.npy','cond_feature2.npy','noise_0.npy','noise_1.npy','latent1_latent.npy','latent1_camera.npy','latent2_latent.npy','latent2_camera.npy'].map(npy));
+  const f1=new Float32Array(f1n.data);
+  const f2=new Float32Array(4096*128);
+  f2.set(f2n.data.subarray(5*128, 5*128+4096*128));
+  row('fixtures', `f1 ${f1n.shape} · f2 ${f2n.shape} -> ${4096*128}`, 'dim');
+
+  let lat=new Float32Array(n0.data);
+  let cam=new Float32Array(n1.data).slice(0,5);
+  // latent1 is a separate one-step run (dt=1 from t=1000), not the halfway
+  // point of this trajectory, so its velocity is the fixture to compare
+  // against: v1 = noise0 - latent1.
+  const v1=new Float32Array(n0.data.length);
+  for(let i=0;i<v1.length;i++) v1[i]=n0.data[i]-l1.data[i];
+  const v1c=new Float32Array(5);
+  for(let i=0;i<5;i++) v1c[i]=n1.data[i]-l1c.data[i];
+  const steps=[[1.0,0.5],[0.5,0.0]];
+  for(let s=0;s<steps.length;s++){
+    const [t,tp]=steps[s], dt=t-tp;
+    const st=performance.now();
+    const out=await sess.run({
+      latent:new ort.Tensor('float32',lat,[1,8192,16]),
+      camera:new ort.Tensor('float32',cam,[1,1,5]),
+      feature1:new ort.Tensor('float32',f1,[1,4101,1280]),
+      feature2:new ort.Tensor('float32',f2,[1,4096,128]),
+      t:new ort.Tensor('float32',new Float32Array([1000*t]),[1]),
+    });
+    const ms=performance.now()-st;
+    const vl=out.out_latent.data, vc=out.out_camera.data;
+    for(let i=0;i<lat.length;i++) lat[i]-=vl[i]*dt;
+    for(let i=0;i<cam.length;i++) cam[i]-=vc[i]*dt;
+    const finiteOk=finite(lat);
+    row(`step ${s+1} (t=${t})`, `${ms.toFixed(0)} ms · finite ${finiteOk}`, finiteOk?'ok':'bad');
+    if(s===0){
+      const sv=stat(vl,v1), scv=stat(vc,v1c);
+      row('  velocity@t=1000 vs fixture v1', `cos ${sv.cos.toFixed(6)} · rel_l2 ${sv.rel.toFixed(5)}`, sv.cos>0.99?'ok':'bad');
+      row('  camera velocity vs v1', `cos ${scv.cos.toFixed(6)} · rel_l2 ${scv.rel.toFixed(5)}`, 'dim');
+    }else{
+      const sl=stat(lat,l2.data), sc=stat(cam,l2c.data);
+      row('  latent vs fixture 2-step', `cos ${sl.cos.toFixed(6)} · rel_l2 ${sl.rel.toFixed(5)}`, sl.cos>0.99?'ok':'bad');
+      row('  camera vs fixture 2-step', `cos ${sc.cos.toFixed(6)} · maxabs ${Math.max(...cam.map((v,i)=>Math.abs(v-l2c.data[i]))).toExponential(2)}`, 'dim');
+    }
+    log(`  step ${s+1}: latent std ${Math.sqrt(lat.reduce((a,x)=>a+x*x,0)/lat.length).toFixed(4)} · camera ${[...cam].map(v=>v.toFixed(4)).join(' ')}`);
+  }
+}
+main().then(()=>{window.__done=true;document.title='READY';})
+  .catch(e=>{row('error',String(e.message).slice(0,300),'bad');log(String(e.stack||e));window.__done=true;document.title='READY';});
+</script>
+</body></html>

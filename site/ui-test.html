@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ui-test</title>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<iframe src="./index.html?local=../w/&v=10" style="width:900px;height:600px"></iframe>
+<script>
+const out = document.getElementById('out');
+const f = document.querySelector('iframe');
+const t0 = Date.now();
+let clicked = false;
+function log(...a) {
+  out.textContent += a.join(' ') + '\n';
+  console.log(...a);
+}
+const iv = setInterval(() => {
+  let d;
+  try { d = f.contentDocument; } catch (e) { log('ERR', e.message); return; }
+  if (!d || !d.body) return;
+  const stage = d.body.dataset.stage;
+  if (!clicked && stage === 'drop') {
+    clicked = true;
+    log('drop ready', Math.round(Date.now() - t0), 'ms');
+    d.querySelector('#samples button').click();
+    log('clicked sample');
+  } else if (stage === 'view') {
+    clearInterval(iv);
+    const s = f.contentWindow.__flipSplat;
+    log('view', s && s.count, 'hint', d.getElementById('view-hint').textContent,
+        'foot', d.getElementById('foot-mode').textContent);
+    window.__done = true;
+  } else if (Date.now() - t0 > 420000) {
+    clearInterval(iv);
+    log('TIMEOUT stage', stage,
+        d.getElementById('think-phase')?.textContent,
+        d.getElementById('think-pct')?.textContent,
+        d.getElementById('meta-text')?.textContent);
+    window.__done = true;
+  }
+}, 500);
+</script>

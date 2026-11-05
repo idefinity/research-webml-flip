@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ply-test</title>
+<style>
+  html, body { margin: 0; background: #0a0a0a; }
+  canvas { display: block; }
+</style>
+<canvas id="c"></canvas>
+<script type="module">
+// 一次性把一张 PLY 渲染出来，给对比表当一格用。
+//
+//   ply-test.html?ply=../w/sheet/x_t20.ply&az=0.6&el=0.18&w=640&h=640
+//
+// 用站点自己的 viewer，所以表里的每一格和用户看到的画面是同一个光栅器；
+// 换 Spark/SuperSplat 会引入第二个变量。拍完把相机停住（stop）再 redraw，
+// 否则动画会一边转一边截，四格角度各不相同。
+
+import { acquireGPU } from './src/gpu.js';
+import { createViewer } from './src/viewer.js';
+import { loadPLY } from './src/ply.js';
+
+const q = new URLSearchParams(location.search);
+const cv = document.getElementById('c');
+// CSS 尺寸必须显式给：只设 width/height 属性时 clientWidth 会被撑到 2^24，
+// viewer 里 canvas.width = clientWidth * dpr 就变成一张 33 M² 的纹理，整帧失败。
+const W = Number(q.get('w') || 640);
+const H = Number(q.get('h') || 640);
+cv.style.width = `${W}px`;
+cv.style.height = `${H}px`;
+cv.width = W;
+cv.height = H;
+
+try {
+  const gpu = await acquireGPU();
+  if (!gpu) throw new Error('no webgpu');
+  const viewer = await createViewer(gpu, cv, {});
+  const splat = await loadPLY(q.get('ply'));
+  // 坐标系试错用：?flip=y 把 y 取反，?rotz=deg 绕 z 转。只改内存里的位置，
+  // 不动文件 —— 先看出图对不对，再决定改哪一头。
+  const flip = q.get('flip') || '';
+  const rotz = Number(q.get('rotz') || 0) * Math.PI / 180;
+  const manual = Boolean(flip) || Boolean(rotz) || q.get('raw') === '1';
+  if (manual) {
+    const d = splat.data;
+    const n = splat.count;
+    const c = Math.cos(rotz);
+    const s = Math.sin(rotz);
+    for (let i = 0; i < n; i++) {
+      const o = i * 16;
+      let x = d[o];
+      let y = d[o + 1];
+      const z = d[o + 2];
+      if (flip.includes('y')) y = -y;
+      if (flip.includes('x')) x = -x;
+      if (rotz) {
+        const nx = x * c - y * s;
+        const ny = x * s + y * c;
+        x = nx; y = ny;
+      }
+      d[o] = x; d[o + 1] = y; d[o + 2] = z;
+    }
+  }
+  viewer.setSplat(splat, { raw: !!manual });
+  await viewer.start();
+  // 先让它自己取景、排序、上传。上一版只等两帧就停相机，抓到的是空帧。
+  await new Promise((r) => setTimeout(r, 1200));
+  const az = q.get('az');
+  const elv = q.get('el');
+  if (az !== null || elv !== null) {
+    viewer.stop();
+    if (az !== null) viewer.cam.az = Number(az);
+    if (elv !== null) viewer.cam.el = Number(elv);
+    viewer.redraw();
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  }
+  window.__stats = { count: splat.count, az: viewer.cam.az, el: viewer.cam.el,
+                     dist: viewer.cam.dist, target: viewer.cam.target };
+  window.__done = true;
+} catch (e) {
+  console.error('ERR', e && (e.stack || e.message) || e);
+  window.__err = String(e && (e.message || e));
+  window.__done = true;
+}
+</script>
