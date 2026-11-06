@@ -22,11 +22,13 @@
 <p class="sub">
 DiT 之外的三段——DINOv3 图像编码、octree 解码、Gaussian 解码——按 <code>triposplat.py</code> 里的真实配置
 在 GPU 上真跑一遍。权重是随机 int4，形状是真的；计时不含回读，每段三次取最小。
-VAE 那段全是 3×3 卷积，单独给一个直接卷积内核的速率当锚。
+VAE 那段全是 3×3 卷积，单独给一个直接卷积内核的速率当锚——一次提交排 8 个 dispatch 再均摊，
+单发一个的话 0.7 ms 的内核会被 1.2 ms 的提交往返整个盖住。
 </p>
 <p class="sub">
-结论：30 秒不成立，而且 DiT 只占一半。四段加起来 48 s，其中 VAE 编码 15 s、DINOv3 5 s、
-两个解码器 2 s。BiRefNet 抠图还没测，按 1.3 TFLOP 的 Swin-L 估还要 3–8 s。
+结论：合计 28 s，离 30 s 只剩不到 2 s，而且 DiT 一个就占 93%（26.2 s）。其余四段加起来只有 1.8 s：
+VAE 编码 0.9 s、DINOv3 0.6 s、两个解码器 0.3 s。BiRefNet 抠图还没测，按 1.3 TFLOP 的 Swin-L
+估还要 3–8 s，那会重新把它推过线——省下的这一两秒在抠图面前不够用，下一步只能动 DiT 或抠图本身。
 </p>
 <table id="t"><tr><th>stage</th><th>result</th></tr></table>
 <div id="log"></div>
@@ -311,10 +313,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 // a register vector. The naive version - one pixel, one weight load per FMA -
 // measured 44 GFLOP/s, which would put the VAE encoder at 154 s and is not a
 // number any real implementation would produce.
+//
+// Two more, both measured on the 128->128 @128^2 anchor below:
+//   weights in [tap][cin][cout] instead of [cout][cin][3][3]. The old layout
+//   gathered the four channel values from four addresses one cin*9 apart, so a
+//   wavefront touched 32 distinct cache lines per weight load; with cout
+//   innermost the vec4 is one contiguous 16 B read and the wavefront lands in a
+//   single 512 B block. Prepacking at load time is setup, not part of any timed
+//   dispatch. -28%.
+//   the ten halo loads are bounds-checked per input channel and per ky row,
+//   which only threads whose run touches the image border ever need. Split on
+//   `inner` once per thread and the interior path drops 30 compares and selects
+//   per channel. -18% on top, though the split alone measures *slower* than the
+//   unsplit kernel: it only pays once the weight stream stops stalling the
+//   pipeline. Together 1.20 -> 0.67 ms per dispatch.
 const CONV_WGSL = /* wgsl */`
 struct CDims { side: u32, cin: u32, cout: u32, pad: u32 };
-@group(0) @binding(0) var<storage, read> X: array<f32>;    // [pixel][cin]
-@group(0) @binding(1) var<storage, read> Wt: array<f32>;   // [cout][cin][3][3]
+@group(0) @binding(0) var<storage, read> X: array<f32>;           // [pixel][cin]
+@group(0) @binding(1) var<storage, read> Wt: array<vec4<f32>>;    // [tap][cin][cout]
 @group(0) @binding(2) var<storage, read_write> Y: array<f32>;
 @group(0) @binding(3) var<uniform> c: CDims;
 
@@ -332,6 +348,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let x0 = (rest / side) * 8u;
   let cg = group * 4u;
   let sd = i32(side);
+  let inner = (x0 > 0u) && (x0 + 8u < side);
 
   var acc: array<vec4<f32>, 8>;
   for (var i = 0u; i < 8u; i = i + 1u) { acc[i] = vec4<f32>(0.0); }
@@ -339,22 +356,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var ky = 0u; ky < 3u; ky = ky + 1u) {
     let yy = i32(row) + i32(ky) - 1;
     if (yy < 0 || yy >= sd) { continue; }
-    for (var kx = 0u; kx < c.cin; kx = kx + 1u) {
-      // the ten columns this eight-pixel run needs
-      var xv: array<f32, 10>;
-      for (var i = 0u; i < 10u; i = i + 1u) {
-        let xx = i32(x0) + i32(i) - 1;
-        var v = 0.0;
-        if (xx >= 0 && xx < sd) { v = X[(u32(yy) * side + u32(xx)) * c.cin + kx]; }
-        xv[i] = v;
+    if (inner) {
+      for (var kx = 0u; kx < c.cin; kx = kx + 1u) {
+        var xv: array<f32, 10>;
+        let p0 = (u32(yy) * side + x0 - 1u) * c.cin + kx;
+        for (var i = 0u; i < 10u; i = i + 1u) { xv[i] = X[p0 + i * c.cin]; }
+        let wrow = (ky * 3u * c.cin + kx) * ng + group;
+        for (var t = 0u; t < 3u; t = t + 1u) {
+          let w = Wt[wrow + t * c.cin * ng];
+          for (var p = 0u; p < 8u; p = p + 1u) {
+            acc[p] = acc[p] + w * xv[p + t];
+          }
+        }
       }
-      for (var t = 0u; t < 3u; t = t + 1u) {
-        let tap = ky * 3u + t;
-        let base = ((cg * c.cin + kx) * 9u + tap);
-        let w = vec4<f32>(Wt[base], Wt[base + c.cin * 9u],
-                          Wt[base + c.cin * 18u], Wt[base + c.cin * 27u]);
-        for (var p = 0u; p < 8u; p = p + 1u) {
-          acc[p] = acc[p] + w * xv[p + t];
+    } else {
+      for (var kx = 0u; kx < c.cin; kx = kx + 1u) {
+        // the ten columns this eight-pixel run needs
+        var xv: array<f32, 10>;
+        for (var i = 0u; i < 10u; i = i + 1u) {
+          let xx = i32(x0) + i32(i) - 1;
+          var v = 0.0;
+          if (xx >= 0 && xx < sd) { v = X[(u32(yy) * side + u32(xx)) * c.cin + kx]; }
+          xv[i] = v;
+        }
+        let wrow = (ky * 3u * c.cin + kx) * ng + group;
+        for (var t = 0u; t < 3u; t = t + 1u) {
+          let w = Wt[wrow + t * c.cin * ng];
+          for (var p = 0u; p < 8u; p = p + 1u) {
+            acc[p] = acc[p] + w * xv[p + t];
+          }
         }
       }
     }
@@ -625,8 +655,8 @@ async function main() {
       const a = await timeOps(kv), b2 = await timeOps(mm), c2 = await timeOps(at);
       row(`  n=${n} 分解`, `kv 投影 ${a.ms.toFixed(2)} · 4 个 gemm×4 块 ${b2.ms.toFixed(2)} · 4 次 cross-attn ${c2.ms.toFixed(2)} ms`, 'dim');
     }
-    log('  octree 每层有一笔与点数无关的固定开销：kv 投影 3.1 ms + cross-attn 6.6 ms，' +
-        '都是把 8192 个 latent 重读一遍。n=3 和 n=2048 时一样，8 层就是 8 次。');
+    log('  octree 每层的 kv 投影 ~2.3 ms 与点数无关——都是把 8192 个 latent 重读一遍，' +
+        'n=3 和 n=2048 时一样，8 层就是 8 次；cross-attn 则随点数走（n=3 时 5.4 ms，n=2048 时 25.7 ms）。');
   }
 
   // Gaussian decoder: 16 blocks at 2048 points, self + cross attention
@@ -659,37 +689,49 @@ async function main() {
     const x = new Float32Array(hw * cin), w = new Float32Array(cout * cin * 9);
     for (let i = 0; i < x.length; i++) x[i] = gpuRand();
     for (let i = 0; i < w.length; i++) w[i] = gpuRand() * 0.1;
-    dev.queue.writeBuffer(X, 0, x); dev.queue.writeBuffer(W, 0, w);
+    // [tap][cin][cout], so the kernel's four-channel vector is one contiguous
+    // load. Real weights get this at load time; it is not part of a dispatch.
+    const wt = new Float32Array(cout * cin * 9);
+    for (let co = 0; co < cout; co++) for (let ci = 0; ci < cin; ci++) for (let tap = 0; tap < 9; tap++)
+      wt[(tap * cin + ci) * cout + co] = w[(co * cin + ci) * 9 + tap];
+    dev.queue.writeBuffer(X, 0, x); dev.queue.writeBuffer(W, 0, wt);
     const bg = dev.createBindGroup({ layout: bglC, entries: [
       { binding: 0, resource: { buffer: X } }, { binding: 1, resource: { buffer: W } },
       { binding: 2, resource: { buffer: Y } }, { binding: 3, resource: { buffer: uniDims([side, cin, cout, 0]) } },
     ]});
-    const encOne = () => {
+    // One dispatch is ~1 ms of kernel behind ~1 ms of submit round-trip, so a
+    // single dispatch measures the round-trip. Queue eight the way the VAE's
+    // ~150 layers actually reach the GPU and divide.
+    const REP = 8;
+    const encOne = (n) => {
       const e = dev.createCommandEncoder();
       const pass = e.beginComputePass();
       pass.setPipeline(pConv); pass.setBindGroup(0, bg);
-      pass.dispatchWorkgroups(Math.ceil((side / 8) * side * (cout / 4) / 64));
+      for (let i = 0; i < n; i++) pass.dispatchWorkgroups(Math.ceil((side / 8) * side * (cout / 4) / 64));
       pass.end();
       return e.finish();
     };
-    dev.queue.submit([encOne()]);
+    dev.queue.submit([encOne(REP)]);
     await dev.queue.onSubmittedWorkDone();
     let best = Infinity;
     for (let r = 0; r < 3; r++) {
-      const cmds = encOne();
+      const cmds = encOne(REP);
       const t0 = performance.now();
       dev.queue.submit([cmds]);
       await dev.queue.onSubmittedWorkDone();
-      best = Math.min(best, performance.now() - t0);
+      best = Math.min(best, (performance.now() - t0) / REP);
     }
     const fl = 2 * hw * cout * cin * 9;
     const rate = fl / (best * 1e6);
-    row('conv 3×3 128→128 @128²（8 像素 tiling）', `${best.toFixed(1)} ms · ${(fl / 1e9).toFixed(1)} GFLOP · ${rate.toFixed(0)} GFLOP/s`, 'ok');
+    row('conv 3×3 128→128 @128²（8 像素 tiling, 每次提交 8 个）',
+        `${best.toFixed(2)} ms · ${(fl / 1e9).toFixed(1)} GFLOP · ${rate.toFixed(0)} GFLOP/s`, 'ok');
     const vaeS = CFG.vae.tflop * 1e12 / (rate * 1e9);      // seconds, not ms
     results.push({ name: 'VAE 编码（按直接卷积估）', ms: vaeS * 1000, tflop: CFG.vae.tflop });
     row('VAE 编码 (6.75 TFLOP, 按上面的速率)', `${vaeS.toFixed(1)} s · 卷积占绝大多数`, 'dim');
-    log(`  conv 速率区间: 直接卷积 ${rate.toFixed(0)} GFLOP/s → ${vaeS.toFixed(1)} s；` +
-        `若做到 GEMM 的 60%（1020 GFLOP/s）→ ${(CFG.vae.tflop / 1.02).toFixed(1)} s`);
+    const gemmRate = results.find(r => r.name === 'DINOv3 编码')?.rate;
+    log(`  conv 直接卷积 ${rate.toFixed(0)} GFLOP/s → VAE ${vaeS.toFixed(1)} s` +
+        (gemmRate ? `；GEMM 实测 ${(gemmRate / 1000).toFixed(1)} TFLOP/s，卷积要做到那个速率 → ` +
+                    `${(CFG.vae.tflop * 1000 / gemmRate).toFixed(1)} s（差 ${(gemmRate / rate).toFixed(1)} 倍）` : ''));
   }
 
   // ------------------------------------------------------------ total
