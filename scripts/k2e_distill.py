@@ -65,7 +65,7 @@ from pathlib import Path
 
 import torch
 
-WORK = Path("/kaggle/working")
+WORK = Path(os.environ.get("FLIP_WORK", "/kaggle/working"))
 REPO = WORK / "TripoSplat"
 CKPT = REPO / "ckpts"
 TRACE_DIR = Path(os.environ.get("FLIP_TRACE_DIR", str(WORK / "k2d")))

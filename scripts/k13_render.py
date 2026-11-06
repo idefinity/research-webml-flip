@@ -50,7 +50,7 @@ def quat_to_rot(q):
     return r
 
 
-def render(path, W=CELL, H=CELL, az=3.35, el=0.18, bg=0.05):
+def render(path, W=CELL, H=CELL, az=3.35, el=0.18, bg=0.05, target=None, dist=None):
     b = read_ply(path)
     xyz = np.nan_to_num(np.stack([b["x"], b["y"], b["z"]], 1).astype(np.float64))
     xyz[:, 1] *= -1.0
@@ -62,10 +62,11 @@ def render(path, W=CELL, H=CELL, az=3.35, el=0.18, bg=0.05):
     R = quat_to_rot(np.stack([b["rot_0"], b["rot_1"], b["rot_2"], b["rot_3"]], 1).astype(np.float64))
 
     lo, hi = xyz.min(0), xyz.max(0)
-    target = (lo + hi) / 2.0
+    target = (lo + hi) / 2.0 if target is None else np.asarray(target, np.float64)
     radius = max(0.5 * float(np.linalg.norm(hi - lo)), 1e-6)
     fov = 0.70
-    dist = radius / np.sin(fov / 2) * 1.08
+    if dist is None:
+        dist = radius / np.sin(fov / 2) * 1.08
     eye = target + dist * np.array([np.sin(az) * np.cos(el),
                                     np.sin(el),
                                     np.cos(az) * np.cos(el)])

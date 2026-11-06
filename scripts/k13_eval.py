@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-WORK = Path("/kaggle/working")
+WORK = Path(os.environ.get("FLIP_WORK", "/kaggle/working"))
 OUT = WORK / "k13_eval"
 OUT.mkdir(parents=True, exist_ok=True)
 TRACES = WORK / "k2d"

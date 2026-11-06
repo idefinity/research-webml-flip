@@ -26,6 +26,7 @@ cos/rel on the velocity at two points of the real trajectory.
 
 Env:
   X_BITS=4 X_BLOCK=128 X_ADA=1 X_MHA=1 X_PARITY=1 X_WORK=/content
+  X_OUT=/content/x1  X_STUDENT=/content/k12_assets/student_e006.pt
 Writes x1/dit.int4.onnx (MHA fused, ada folded), x1/report.json, x1/log.txt.
 """
 import gc
@@ -41,8 +42,9 @@ import numpy as np
 WORK = Path(os.environ.get("X_WORK", "/content"))
 REPO = WORK / "TripoSplat"
 ASSETS = WORK / "k12_assets"
-OUT = WORK / "x1"
+OUT = Path(os.environ.get("X_OUT", str(WORK / "x1")))
 OUT.mkdir(exist_ok=True)
+STUDENT = Path(os.environ.get("X_STUDENT", str(ASSETS / "student_e006.pt")))
 
 BITS = int(os.environ.get("X_BITS", "4"))
 BLOCK = int(os.environ.get("X_BLOCK", "128"))
@@ -269,7 +271,7 @@ def main():
 
     # ---- student
     flow = M.LatentSeqMMFlowModel(**T.FLOW_MODEL_ARGS)
-    blob = torch.load(str(ASSETS / "student_e006.pt"), map_location="cpu",
+    blob = torch.load(str(STUDENT), map_location="cpu",
                       weights_only=True)
     sd = blob["model"]
     sd = {k[len("module."):] if k.startswith("module.") else k: v for k, v in sd.items()}

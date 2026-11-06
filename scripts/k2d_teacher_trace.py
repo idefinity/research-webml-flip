@@ -62,7 +62,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-WORK = Path("/kaggle/working")
+WORK = Path(os.environ.get("FLIP_WORK", "/kaggle/working"))
 REPO = WORK / "TripoSplat"
 CKPT = REPO / "ckpts"
 OUT = WORK / "k2d"
