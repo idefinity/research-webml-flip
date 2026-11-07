@@ -172,6 +172,8 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
   const base = meta.base_offset_scale;
   const lr = meta.rep_config.lr;
   const perturbe = meta.rep_config.perturbe_size;
+  // 上游 _scaling setter 最后一步：sqrt(softplus^2 + filter_kernel_size_3d^2)
+  const k2 = meta.rep_config.filter_kernel_size_3d ** 2;
 
   const count = numPoints * ng;
   const data = new Float32Array(count * 16);
@@ -238,9 +240,9 @@ export function buildGaussians({ features, points, meta, numPoints = 2048 }) {
       data[o + 5] = clamp01(0.5 + C0 * features[f + dc + 1] * lr._features_dc);
       data[o + 6] = clamp01(0.5 + C0 * features[f + dc + 2] * lr._features_dc);
       data[o + 7] = 0;
-      data[o + 8] = softplus(features[f + sc] * lr._scaling + SCALE_BIAS);
-      data[o + 9] = softplus(features[f + sc + 1] * lr._scaling + SCALE_BIAS);
-      data[o + 10] = softplus(features[f + sc + 2] * lr._scaling + SCALE_BIAS);
+      data[o + 8] = Math.sqrt(softplus(features[f + sc] * lr._scaling + SCALE_BIAS) ** 2 + k2);
+      data[o + 9] = Math.sqrt(softplus(features[f + sc + 1] * lr._scaling + SCALE_BIAS) ** 2 + k2);
+      data[o + 10] = Math.sqrt(softplus(features[f + sc + 2] * lr._scaling + SCALE_BIAS) ** 2 + k2);
       data[o + 11] = 0;
       data[o + 12] = qw2 / qlen;
       data[o + 13] = qx2 / qlen;
