@@ -1,0 +1,144 @@
+<!doctype html><meta charset="utf-8"><title>W4A16 final</title>
+<style>body{background:#14130f;color:#ecebe6;font:12px ui-monospace,Menlo,monospace;padding:16px}td{padding:3px 14px 3px 0}.ok{color:#7fd18a}.bad{color:#e57b6b}#log{white-space:pre;color:#8a8577;margin-top:10px}</style>
+<table id="t"><tr><th>shape</th><th>config</th><th>ms</th><th>TFLOPS</th><th>cos</th><th>GFLOP</th></tr></table><div id="log"></div>
+<script type="module">
+import { parseNPY } from '../../site/src/npy.js';
+const $t=document.getElementById('t'), $l=document.getElementById('log');
+const row=(a,b,ms,tf,cos,gf)=>{const ok=cos>0.9999;const tr=document.createElement('tr');tr.innerHTML=`<td>${a}</td><td>${b}</td><td>${ms}</td><td>${tf}</td><td class="${ok?'ok':'bad'}">${cos.toFixed(7)}</td><td>${gf}</td>`;$t.appendChild(tr);window.__rows=(window.__rows||[]).concat([[a,b,+ms,+tf,cos,+gf]]);};
+const log=s=>{console.log(s);$l.textContent+=s+'\n';};
+try{
+const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+const dev=await adapter.requestDevice({requiredFeatures:['chromium-experimental-subgroup-matrix','shader-f16','subgroups','timestamp-query'],
+ requiredLimits:{maxBufferSize:adapter.limits.maxBufferSize,maxStorageBufferBindingSize:adapter.limits.maxStorageBufferBindingSize,maxComputeWorkgroupStorageSize:adapter.limits.maxComputeWorkgroupStorageSize,maxComputeInvocationsPerWorkgroup:adapter.limits.maxComputeInvocationsPerWorkgroup,maxComputeWorkgroupSizeX:adapter.limits.maxComputeWorkgroupSizeX,maxComputeWorkgroupSizeY:adapter.limits.maxComputeWorkgroupSizeY}});
+dev.addEventListener('uncapturederror',e=>log('GPU '+e.error.message));
+const man=await (await fetch('manifest.json')).json();
+const byName=Object.fromEntries(man.tensors.map(t=>[t.name,t]));
+const bin=await (await fetch('int4.bin')).arrayBuffer();log('bin loaded');
+const refMeta=await (await fetch('ref_meta.json')).json();
+
+function mkShader(N,K,sf,sg){
+  const wg=256, TR=2*sf*16, TC=2*sg*16, ku=2;
+  const acc=[];for(let i=0;i<sf;i++)for(let j=0;j<sg;j++)acc.push(`  var c${i}_${j}: subgroup_matrix_result<f32,16,16>;`);
+  let stores='';for(let i=0;i<sf;i++)for(let j=0;j<sg;j++)stores+=`  subgroupMatrixStore(&C, ob + ${i*16}u * NN + ${j*16}u, c${i}_${j}, false, NN);\n`;
+  const block=(off)=>`{
+      let k0 = kb + ${off}u;
+      ${Array.from({length:sf},(_,i)=>`let a${i} = subgroupMatrixLoad<subgroup_matrix_left<f16,16,16>>(&A, abase + ${i*16}u * KK + k0, false, KK);`).join('\n      ')}
+      ${Array.from({length:sg},(_,j)=>`let b${j} = subgroupMatrixLoad<subgroup_matrix_right<f16,16,16>>(&B, bbase + ${j*16}u * KK + k0, true, KK);`).join('\n      ')}
+      ${(()=>{let s='';for(let i=0;i<sf;i++)for(let j=0;j<sg;j++)s+=`c${i}_${j} = subgroupMatrixMultiplyAccumulate(a${i}, b${j}, c${i}_${j});\n      `;return s;})()}}`;
+  return `
+enable f16; enable subgroups; enable chromium_experimental_subgroup_matrix;
+diagnostic(off, chromium.subgroup_matrix_uniformity);
+@group(0) @binding(0) var<storage, read> A: array<f16>;
+@group(0) @binding(1) var<storage, read> B: array<f16>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+const NN: u32 = ${N}u;
+const KK: u32 = ${K}u;
+@compute @workgroup_size(${wg})
+fn main(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wid: vec3<u32>) {
+  let wg_n = wid.x * ${TC}u;
+  let wg_m = wid.y * ${TR}u;
+  let sg = lid / 64u;
+  let sr = sg / 2u;
+  let sc = sg % 2u;
+${acc.join('\n')}
+  let abase = (wg_m + sr * ${sf*16}u) * KK;
+  let bbase = (wg_n + sc * ${sg*16}u) * KK;
+  for (var kb: u32 = 0u; kb < KK; kb = kb + 32u) {
+${block(0)}
+${block(16)}
+  }
+  let ob = (wg_m + sr * ${sf*16}u) * NN + wg_n + sc * ${sg*16}u;
+${stores}}`;
+}
+const pipe=(code,name)=>dev.createComputePipelineAsync({layout:'auto',compute:{module:dev.createShaderModule({code,label:name}),entryPoint:'main'}});
+const upload=(arr)=>{const b=dev.createBuffer({size:arr.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(b,0,arr);return b;};
+const dequantShader=(N,K)=>`
+enable f16;
+@group(0) @binding(0) var<storage, read> Wq: array<u32>;
+@group(0) @binding(1) var<storage, read> Ws: array<f32>;
+@group(0) @binding(2) var<storage, read_write> Bf: array<f16>;
+const KU: u32 = ${K/8}u;
+const KS: u32 = ${K/32}u;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  if (i >= ${N*K/8}u) { return; }
+  let row = i / KU;
+  let w = i - row * KU;
+  let s = Ws[row * KS + w / 4u];
+  let word = Wq[i];
+  for (var j: u32 = 0u; j < 8u; j = j + 1u) { Bf[i * 8u + j] = f16((f32((word >> (4u * j)) & 0xFu) - 8.0) * s); }
+}`;
+const cvtShader=(n)=>`
+enable f16;
+@group(0) @binding(0) var<storage, read> X: array<f32>;
+@group(0) @binding(1) var<storage, read_write> Y: array<f16>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x + gid.y * 16776960u;
+  if (i >= ${n}u) { return; }
+  Y[i] = f16(X[i]);
+}`;
+function randF32(n,seed=1){const out=new Float32Array(n);let s=seed>>>0;for(let i=0;i<n;i++){s^=s<<13;s>>>=0;s^=s>>>17;s^=s<<5;s>>>=0;out[i]=(s/4294967296-0.5)*2;}return out;}
+async function bench(p,bg,gx,gy,iters=20,batches=5){
+  const qs=dev.createQuerySet({type:'timestamp',count:2});
+  const qbuf=dev.createBuffer({size:16,usage:GPUBufferUsage.QUERY_RESOLVE|GPUBufferUsage.COPY_SRC});
+  const qstg=dev.createBuffer({size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  const run=()=>{const e=dev.createCommandEncoder();for(let i=0;i<iters;i++){const ts=(i===0)?{querySet:qs,beginningOfPassWriteIndex:0}:((i===iters-1)?{querySet:qs,endOfPassWriteIndex:1}:null);const p2=e.beginComputePass(ts?{timestampWrites:ts}:{});p2.setPipeline(p);p2.setBindGroup(0,bg);p2.dispatchWorkgroups(gx,gy);p2.end();}e.resolveQuerySet(qs,0,2,qbuf,0);e.copyBufferToBuffer(qbuf,0,qstg,0,16);dev.queue.submit([e.finish()]);};
+  run();await dev.queue.onSubmittedWorkDone();
+  const out=[];
+  for(let b=0;b<batches;b++){run();await dev.queue.onSubmittedWorkDone();await qstg.mapAsync(GPUMapMode.READ);const v=new BigUint64Array(qstg.getMappedRange().slice(0));qstg.unmap();out.push(Number(v[1]-v[0])/1e6/iters);}
+  out.sort((a,b)=>a-b);qs.destroy();qbuf.destroy();qstg.destroy();return out[Math.floor(out.length/2)];
+}
+const CFG={'attn.qkv':[8,4],'attn.out':[4,8],'mlp.mlp.mlp.0':[8,4],'mlp.mlp.mlp.2':[4,8]};
+const MAXM=12294;
+let sumMs=0, sumGf=0, deqAll=0, cvtAll=0;
+for(const [tag,m] of Object.entries(refMeta)){
+  const {N,K,name}=m; const t=byName[name];
+  const q=new Uint8Array(bin,t.offset_q,t.bytes_q);
+  const Wq=upload(new Uint32Array(q.buffer,q.byteOffset,q.byteLength/4));
+  const Ws=upload(new Float32Array(bin.slice(t.offset_s,t.offset_s+t.bytes_s)));
+  const Bf=dev.createBuffer({size:N*K*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const dq=await pipe(dequantShader(N,K),'dq'+tag);
+  const dqbg=dev.createBindGroup({layout:dq.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:Wq}},{binding:1,resource:{buffer:Ws}},{binding:2,resource:{buffer:Bf}}]});
+  const rdq=()=>{const e=dev.createCommandEncoder();const p=e.beginComputePass();p.setPipeline(dq);p.setBindGroup(0,dqbg);p.dispatchWorkgroups(Math.ceil(N*K/8/256));p.end();dev.queue.submit([e.finish()]);};
+  // time dequant (one-time)
+  log('dq dispatch '+tag);let t0=performance.now();rdq();await dev.queue.onSubmittedWorkDone();const dqMs=performance.now()-t0;deqAll+=dqMs;log('dq done '+dqMs.toFixed(2)+'ms');
+  const key=name.replace('blocks.0.','');
+  const [sf,sg]=CFG[name.replace('blocks.0.','')];
+  const TR=2*sf*16, TC=2*sg*16, MP=Math.ceil(MAXM/TR)*TR;
+  const Abig32=upload(randF32(MP*K,12345));
+  const Af=dev.createBuffer({size:MP*K*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const cvt=await pipe(cvtShader(MP*K),'cv'+tag);
+  const cbg=dev.createBindGroup({layout:cvt.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:Abig32}},{binding:1,resource:{buffer:Af}}]});
+  const rcvt=()=>{const e=dev.createCommandEncoder();const p=e.beginComputePass();p.setPipeline(cvt);p.setBindGroup(0,cbg);p.dispatchWorkgroups(Math.min(65535,Math.ceil(MP*K/256)),Math.ceil(MP*K/256/65535));p.end();dev.queue.submit([e.finish()]);};
+  log('cvt dispatch');t0=performance.now();rcvt();await dev.queue.onSubmittedWorkDone();cvtAll+=performance.now()-t0;log('cvt done');
+  const C=dev.createBuffer({size:MP*N*4,usage:GPUBufferUsage.STORAGE});
+  // validate
+  const Aref=parseNPY(await (await fetch(m.a)).arrayBuffer());
+  const Cref=parseNPY(await (await fetch(m.c)).arrayBuffer());
+  const A32v=upload(Aref.data);
+  const Afv=dev.createBuffer({size:256*K*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const cv2=await pipe(cvtShader(256*K),'cv2'+tag);
+  const cbg2=dev.createBindGroup({layout:cv2.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:A32v}},{binding:1,resource:{buffer:Afv}}]});
+  {const e=dev.createCommandEncoder();const p=e.beginComputePass();p.setPipeline(cv2);p.setBindGroup(0,cbg2);p.dispatchWorkgroups(Math.ceil(256*K/256));p.end();dev.queue.submit([e.finish()]);}
+  log('compile gemm');const p=await pipe(mkShader(N,K,sf,sg),name);log('gemm compiled');
+  const cvb=dev.createBuffer({size:256*N*4,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC});
+  let bg=dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:Afv}},{binding:1,resource:{buffer:Bf}},{binding:2,resource:{buffer:cvb}}]});
+  {const e=dev.createCommandEncoder();const pp=e.beginComputePass();pp.setPipeline(p);pp.setBindGroup(0,bg);pp.dispatchWorkgroups(Math.ceil(N/TC),Math.ceil(256/TR));pp.end();
+   const stg=dev.createBuffer({size:256*N*4,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});e.copyBufferToBuffer(cvb,0,stg,0,256*N*4);dev.queue.submit([e.finish()]);
+   await stg.mapAsync(GPUMapMode.READ);const got=new Float32Array(stg.getMappedRange().slice(0));stg.unmap();
+   const rf=Cref.data;let dot=0,ng=0,nr=0;for(let i=0;i<rf.length;i++){const a=got[i],b=rf[i];dot+=a*b;ng+=a*a;nr+=b*b;}
+   var cos=dot/Math.sqrt(ng*nr);stg.destroy();cvb.destroy();}
+  bg=dev.createBindGroup({layout:p.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:Af}},{binding:1,resource:{buffer:Bf}},{binding:2,resource:{buffer:C}}]});
+  log('bench');const ms=await bench(p,bg,Math.ceil(N/TC),Math.ceil(MP/TR));log('bench done');
+  const gf=2*MAXM*N*K/1e9;sumMs+=ms;sumGf+=gf;
+  row(`${key} ${sf*16}x${sg*16}`, `${TR}x${TC} wg256 ku2`, ms.toFixed(3),(gf/ms).toFixed(1),cos,gf.toFixed(1));
+  Abig32.destroy();Af.destroy();C.destroy();A32v.destroy();Afv.destroy();Wq.destroy();Ws.destroy();Bf.destroy();
+}
+row('TOTAL per block','',sumMs.toFixed(3),(sumGf/sumMs).toFixed(1),1,sumGf.toFixed(1));
+row('per step x24','',(sumMs*24).toFixed(1),(sumGf*24/(sumMs*24)).toFixed(1),1,(sumGf*24).toFixed(0));
+row('4 steps x24','',(sumMs*96).toFixed(0),(sumGf*96/(sumMs*96)).toFixed(1),1,(sumGf*96).toFixed(0));
+}catch(e){row('FATAL','','','','',0);log(String(e.stack||e));console.error(e);}
+document.title='READY';
+</script>
