@@ -32,8 +32,10 @@ export async function acquireGPU() {
     return {
       adapter,
       device,
-      label: [info.vendor, info.architecture].filter(Boolean).join(' ') || 'unknown GPU',
+      label: [info.vendor, info.architecture, info.description].filter(Boolean).join(' ')
+             || 'unknown GPU',
       features: [...adapter.features],
+      fallback: !!(adapter.isFallbackAdapter || info.isFallbackAdapter),
     };
   })();
   return pending;

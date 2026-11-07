@@ -14,6 +14,7 @@ import { parseNPY } from './npy.js';
 import { sampleOctree, buildGaussians } from './decoder.js';
 
 export const MODE = 'real';
+export const BUILD = '2026-11-06-clamp-cache';
 
 export const CONDITION_IMAGE = '../assets/k2u/hf_0000.jpg';
 export const CONDITION_NOTE = '编码器按需加载：首次约 197 MB，之后走缓存';

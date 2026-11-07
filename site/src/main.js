@@ -3,7 +3,7 @@ import { createLoader } from './loader.js';
 import { createThink } from './think.js';
 import { createViewer } from './viewer.js';
 import {
-  MODE, STAGES, SAMPLES, runInference, initModels, modelsReady,
+  MODE, BUILD, STAGES, SAMPLES, runInference, initModels, modelsReady,
   ARTIFACT_BYTES,
 } from './pipeline.js';
 
@@ -67,6 +67,8 @@ function setStage(name) {
 
 async function boot() {
   document.body.dataset.booted = '1';
+  document.body.dataset.build = BUILD;
+  console.info('[flip] build', BUILD);
   el.footMode.textContent = MODE === 'demo'
     ? '演示管线：推理尚未接线，结果来自预烘焙 PLY'
     : '正在准备本机推理';
@@ -76,7 +78,10 @@ async function boot() {
 
   if (gpu) {
     el.metaText.textContent = gpu.label;
-    el.footGpu.textContent = `${gpu.label} · ${gpu.features.includes('shader-f16') ? 'f16' : 'no-f16'}`;
+    const f16 = gpu.features.includes('shader-f16');
+    el.footGpu.textContent = `${gpu.label} · ${f16 ? 'f16' : 'no-f16'} · build ${BUILD}`
+      + (gpu.fallback ? ' · 软件回退，结果可能失真'
+                      : (!f16 ? ' · 缺 shader-f16，速度/精度可能下降' : ''));
     try {
       loader = await createLoader(gpu, el.bootCanvas);
       loader.start();
@@ -169,7 +174,9 @@ function preload() {
         console.warn('model preload failed:', failure.message);
       } else {
         document.body.dataset.weights = 'ok';
-        el.bootChecks.textContent = `${host === 'local' ? '本地文件' : host} · 3 个图 + 4 个夹具 · 已进 Cache`;
+        const hostLabel = host === 'local' ? '本地文件' : host === 'cache' ? '浏览器缓存' : host;
+        const cacheLabel = host === 'cache' ? 'Cache API · 无需重下' : '本次已进 Cache';
+        el.bootChecks.textContent = `${hostLabel} · 3 个图 + 4 个夹具 · ${cacheLabel}`;
       }
     });
   });
@@ -327,8 +334,8 @@ async function enterView(model) {
       });
     }
     // decoder 已经产出 viewer 坐标系（Y 向上），不再翻 y；
-    // 正面视角由离线 EWA 转台实测（az=2.0 是脸部，3.35 是侧后方）
-    viewer.setSplat(model, { raw: true, az: 2.0, el: 0.18 });
+    // 正面视角实测：viewer az≈0.2 是脸，2.0 已经是后脑勺
+    viewer.setSplat(model, { raw: true, az: 0.21, el: 0.18 });
     viewer.start();
     window.__flipView = viewer;   // 调试入口：__.cam.az = 1.57; __.redraw()
   } catch (err) {
